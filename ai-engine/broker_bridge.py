@@ -1,0 +1,126 @@
+import os
+from typing import Literal
+
+import MetaTrader5 as mt5
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+load_dotenv()
+
+app = FastAPI(title="MT5 Broker Bridge", version="1.0.0")
+
+
+class LiveTradeRequest(BaseModel):
+    symbol: str
+    action: Literal["BUY", "SELL"]
+    timeframe: str
+    volume: float = Field(default=0.01, gt=0)
+    stop_loss_pips: float = Field(default=50.0, gt=0)
+    take_profit_pips: float = Field(default=100.0, gt=0)
+    confidence_score: float | None = None
+
+
+def _pip_size(symbol: str) -> float:
+    normalized = symbol.upper()
+    if normalized == "XAUUSD":
+        return 0.1
+    if normalized.endswith("JPY"):
+        return 0.01
+    return 0.0001
+
+
+def _connect_mt5() -> None:
+    login = os.getenv("MT5_LOGIN")
+    password = os.getenv("MT5_PASSWORD")
+    server = os.getenv("MT5_SERVER")
+    path = os.getenv("MT5_PATH")
+
+    initialized = mt5.initialize(
+        path=path if path else None,
+        login=int(login) if login else None,
+        password=password,
+        server=server,
+    )
+
+    if not initialized:
+        raise HTTPException(status_code=503, detail=f"MT5 initialize failed: {mt5.last_error()}")
+
+
+@app.post("/execute")
+def execute_trade(request: LiveTradeRequest):
+    _connect_mt5()
+
+    symbol_info = mt5.symbol_info(request.symbol)
+    if symbol_info is None:
+        mt5.shutdown()
+        raise HTTPException(status_code=400, detail=f"Unknown symbol: {request.symbol}")
+
+    if not symbol_info.visible and not mt5.symbol_select(request.symbol, True):
+        mt5.shutdown()
+        raise HTTPException(status_code=400, detail=f"Unable to select symbol: {request.symbol}")
+
+    tick = mt5.symbol_info_tick(request.symbol)
+    if tick is None:
+        mt5.shutdown()
+        raise HTTPException(status_code=503, detail=f"No tick data for {request.symbol}")
+
+    pip_size = _pip_size(request.symbol)
+    volume_step = symbol_info.volume_step or 0.01
+    volume_min = symbol_info.volume_min or 0.01
+    volume = max(request.volume, volume_min)
+    volume = round(volume / volume_step) * volume_step
+    volume = max(volume, volume_min)
+
+    is_buy = request.action.upper() == "BUY"
+    price = tick.ask if is_buy else tick.bid
+    stop_loss = price - (request.stop_loss_pips * pip_size) if is_buy else price + (request.stop_loss_pips * pip_size)
+    take_profit = price + (request.take_profit_pips * pip_size) if is_buy else price - (request.take_profit_pips * pip_size)
+
+    order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+    request_payload = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": request.symbol,
+        "volume": volume,
+        "type": order_type,
+        "price": price,
+        "sl": stop_loss,
+        "tp": take_profit,
+        "deviation": 20,
+        "magic": 20260411,
+        "comment": f"TRADING {request.timeframe} live execution",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request_payload)
+    mt5.shutdown()
+
+    if result is None:
+        raise HTTPException(status_code=502, detail=f"MT5 order_send returned no result: {mt5.last_error()}")
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "retcode": result.retcode,
+                "comment": result.comment,
+                "request": request_payload,
+            },
+        )
+
+    return {
+        "status": "EXECUTED",
+        "order": result.order,
+        "deal": result.deal,
+        "volume": volume,
+        "price": price,
+        "sl": stop_loss,
+        "tp": take_profit,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("MT5_BRIDGE_PORT", "9000")))

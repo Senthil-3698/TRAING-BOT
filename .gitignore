@@ -1,0 +1,12 @@
+.env
+ai-engine/.env
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+execution-engine/target/
+ai-engine/venv/
+.venv/
+.idea/
+.vscode/

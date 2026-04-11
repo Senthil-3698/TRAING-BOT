@@ -1,0 +1,9 @@
+httpx
+redis
+google-genai
+python-dotenv
+fastapi
+uvicorn
+MetaTrader5
+rich
+psycopg[binary]
