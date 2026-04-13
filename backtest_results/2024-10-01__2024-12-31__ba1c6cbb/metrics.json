@@ -1,0 +1,39 @@
+{
+  "total_trades": 468,
+  "winners": 139,
+  "losers": 329,
+  "win_rate_pct": 29.7,
+  "profit_factor": 0.363,
+  "sharpe_ratio": -12.758,
+  "sortino_ratio": -16.42,
+  "max_drawdown_pct": 98.17,
+  "max_drawdown_dollar": 10062.16,
+  "average_r": -0.401,
+  "expectancy_usd": -20.94,
+  "total_pnl": -9799.76,
+  "initial_balance": 10000.0,
+  "final_balance": 200.24,
+  "total_return_pct": -98.0,
+  "avg_win_usd": 40.22,
+  "avg_loss_usd": -46.78,
+  "walk_forward": {
+    "split_ratio_in_sample": 0.7,
+    "in_sample_trades": 328,
+    "out_of_sample_trades": 140,
+    "in_sample_sharpe": -6.306089,
+    "out_of_sample_sharpe": -4.286152,
+    "oos_drop_vs_insample_pct": 0.0,
+    "flag_oos_drop_gt_30pct": false
+  },
+  "monte_carlo": {
+    "iterations": 1000,
+    "sample_size": 468,
+    "base_sharpe": -5.668827,
+    "mean_sharpe": -5.717075,
+    "std_sharpe": 0.810534,
+    "p05_sharpe": -7.054791,
+    "p50_sharpe": -5.707476,
+    "p95_sharpe": -4.395333,
+    "prob_sharpe_positive": 0.0
+  }
+}

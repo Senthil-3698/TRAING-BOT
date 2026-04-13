@@ -1,0 +1,3 @@
+trade_id,action,open_time,close_time,entry_price,initial_sl,tp,lot_size,close_price,close_reason,stage_at_close,pnl_usd,r_multiple,initial_risk_points,signal_time,h1_bias,h4_bias,integrated_bias,bias_alignment,session_label,day_of_week,mfe_r,mae_r
+1,SELL,2024-10-08 11:35:00+00:00,2024-11-07 12:55:00+00:00,2604.534,2606.04275,2600.76212,1.33,2699.764,SL,ENTRY,-12674.9,-63.165,150.87500000001745,2024-10-08 11:34:00+00:00,BEARISH,BEARISH,BEARISH,ALIGNED,LONDON,Tuesday,0.0,63.118
+2,SELL,2024-10-09 10:31:00+00:00,2024-11-14 07:30:00+00:00,2605.888,2607.39675,2602.11612,0.01,2602.31612,FULL_EXIT,TRAILING,5.5,3.642,150.87500000001745,2024-10-09 10:30:00+00:00,BEARISH,BEARISH,BEARISH,ALIGNED,LONDON,Wednesday,34.017,0.0

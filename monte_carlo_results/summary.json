@@ -1,0 +1,25 @@
+{
+  "verdict": "NO_EDGE",
+  "verdict_detail": "Only 0.0% profitable. Do NOT go live.",
+  "inputs": {
+    "n_trades": 1504,
+    "n_simulations": 1000,
+    "initial_balance": 10000.0,
+    "risk_per_trade_pct": 1.0
+  },
+  "simulation_final_returns_pct": {
+    "mean": -100.0,
+    "median": -100.0,
+    "std": 0.0,
+    "p5": -100.0,
+    "p95": -100.0
+  },
+  "risk_metrics": {
+    "profitable_simulations_pct": 0.0,
+    "var_95_pct": -100.0,
+    "cvar_95_pct": -100.0,
+    "median_max_drawdown_pct": 100.0,
+    "p95_max_drawdown_pct": 100.0,
+    "worst_max_drawdown_pct": 100.0
+  }
+}

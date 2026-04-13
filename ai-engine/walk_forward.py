@@ -22,11 +22,15 @@ except ImportError:
 
 @dataclass
 class ParamSet:
-    rsi_buy: int
-    rsi_sell: int
-    ema_distance_min: float
+    confidence_min: float
+    regime_adx_min: float
     cooldown_bars: int
     partial_close_r: float
+    atr_sl_mult: float
+    kelly_cap: float
+
+
+MIN_TRADES_PER_WINDOW = 30
 
 
 @dataclass
@@ -94,6 +98,7 @@ def _fetch_m1(symbol: str, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
 
 def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    out = out.sort_values("time").reset_index(drop=True)
     out["ema20"] = out["close"].ewm(span=20, adjust=False).mean()
     out["ema50"] = out["close"].ewm(span=50, adjust=False).mean()
 
@@ -112,31 +117,59 @@ def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["atr14"] = tr.rolling(14, min_periods=14).mean()
     out["ema_distance"] = (out["close"] - out["ema20"]).abs() / out["close"].replace(0, np.nan)
 
+    # ADX proxy for regime detection (trend vs ranging).
+    plus_dm = out["high"].diff()
+    minus_dm = -out["low"].diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    atr = tr.rolling(14, min_periods=14).mean()
+    plus_di = 100 * (plus_dm.rolling(14, min_periods=14).mean() / atr.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.rolling(14, min_periods=14).mean() / atr.replace(0, np.nan))
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    out["adx14"] = dx.rolling(14, min_periods=14).mean()
+
+    # MTF confluence proxies: M5/H1/H4 EMA20 vs EMA50 directional bias.
+    temp = out.set_index("time")
+    for tf_name, rule in [("m5", "5min"), ("h1", "1h"), ("h4", "4h")]:
+        close_tf = temp["close"].resample(rule).last().ffill()
+        ema20_tf = close_tf.ewm(span=20, adjust=False).mean()
+        ema50_tf = close_tf.ewm(span=50, adjust=False).mean()
+        bias_tf = np.where(ema20_tf > ema50_tf, 1, -1)
+        out[f"{tf_name}_bias"] = pd.Series(bias_tf, index=ema20_tf.index).reindex(out["time"], method="ffill").values
+
+    # Optional live-stack fields from dataset. If absent, apply conservative defaults.
+    if "news_block" not in out.columns:
+        out["news_block"] = 0
+    if "ai_confidence" not in out.columns:
+        out["ai_confidence"] = 75.0
+
     return out.dropna().reset_index(drop=True)
 
 
 def _build_param_grid() -> list[ParamSet]:
     grid = []
-    for rsi_buy, rsi_sell, ema_min, cooldown, partial_r in itertools.product(
-        [30, 35, 40],
-        [60, 65, 70],
-        [0.0006, 0.0010, 0.0014],
+    for confidence_min, regime_adx_min, cooldown, partial_r, atr_sl_mult, kelly_cap in itertools.product(
+        [60.0, 65.0, 70.0],
+        [18.0, 22.0, 26.0],
         [3, 5, 8],
         [1.2, 1.4, 1.6, 1.8, 2.0],
+        [1.2, 1.5, 1.8],
+        [0.0125, 0.015, 0.02],
     ):
         grid.append(
             ParamSet(
-                rsi_buy=rsi_buy,
-                rsi_sell=rsi_sell,
-                ema_distance_min=ema_min,
+                confidence_min=confidence_min,
+                regime_adx_min=regime_adx_min,
                 cooldown_bars=cooldown,
                 partial_close_r=partial_r,
+                atr_sl_mult=atr_sl_mult,
+                kelly_cap=kelly_cap,
             )
         )
     return grid
 
 
-def _simulate_window(df: pd.DataFrame, params: ParamSet, initial_balance: float = 10_000.0, risk_per_trade: float = 0.01) -> dict[str, Any]:
+def _simulate_window(df: pd.DataFrame, params: ParamSet, initial_balance: float = 10_000.0, base_risk_per_trade: float = 0.01) -> dict[str, Any]:
     if df.empty:
         return {"sharpe": 0.0, "trades": 0, "return_pct": 0.0, "final_balance": initial_balance}
 
@@ -144,10 +177,29 @@ def _simulate_window(df: pd.DataFrame, params: ParamSet, initial_balance: float 
     open_trade: TradeState | None = None
     last_entry_idx = -10_000
     trade_returns: list[float] = []
+    trade_r_values: list[float] = []
+
+    def _kelly_fraction() -> float:
+        # Fractional Kelly on realized R outcomes. Falls back to base risk when history is thin.
+        if len(trade_r_values) < 30:
+            return base_risk_per_trade
+        wins = [x for x in trade_r_values if x > 0]
+        losses = [x for x in trade_r_values if x < 0]
+        if not wins or not losses:
+            return base_risk_per_trade
+        w = len(wins) / len(trade_r_values)
+        avg_win = float(np.mean(wins))
+        avg_loss = abs(float(np.mean(losses)))
+        if avg_loss <= 0:
+            return base_risk_per_trade
+        r_ratio = avg_win / avg_loss
+        f_star = w - ((1 - w) / max(r_ratio, 1e-6))
+        frac = max(0.0025, min(0.25 * max(f_star, 0.0), params.kelly_cap))
+        return float(frac)
 
     for i in range(1, len(df)):
         row = df.iloc[i]
-        prev = df.iloc[i - 1]
+        risk_fraction = _kelly_fraction()
 
         if open_trade is not None:
             # Conservative ordering: stop checks before favorable triggers.
@@ -155,8 +207,9 @@ def _simulate_window(df: pd.DataFrame, params: ParamSet, initial_balance: float 
                 if row["low"] <= open_trade.sl:
                     r_out = (open_trade.sl - open_trade.entry) / open_trade.risk
                     open_trade.realized_r += open_trade.remaining * r_out
-                    pnl = balance * risk_per_trade * open_trade.realized_r
+                    pnl = balance * risk_fraction * open_trade.realized_r
                     trade_returns.append(pnl / max(balance, 1.0))
+                    trade_r_values.append(open_trade.realized_r)
                     balance += pnl
                     open_trade = None
                     continue
@@ -169,8 +222,9 @@ def _simulate_window(df: pd.DataFrame, params: ParamSet, initial_balance: float 
 
                 if row["high"] >= open_trade.entry + 2.5 * open_trade.risk:
                     open_trade.realized_r += open_trade.remaining * 2.5
-                    pnl = balance * risk_per_trade * open_trade.realized_r
+                    pnl = balance * risk_fraction * open_trade.realized_r
                     trade_returns.append(pnl / max(balance, 1.0))
+                    trade_r_values.append(open_trade.realized_r)
                     balance += pnl
                     open_trade = None
                     continue
@@ -179,8 +233,9 @@ def _simulate_window(df: pd.DataFrame, params: ParamSet, initial_balance: float 
                 if row["high"] >= open_trade.sl:
                     r_out = (open_trade.entry - open_trade.sl) / open_trade.risk
                     open_trade.realized_r += open_trade.remaining * r_out
-                    pnl = balance * risk_per_trade * open_trade.realized_r
+                    pnl = balance * risk_fraction * open_trade.realized_r
                     trade_returns.append(pnl / max(balance, 1.0))
+                    trade_r_values.append(open_trade.realized_r)
                     balance += pnl
                     open_trade = None
                     continue
@@ -193,8 +248,9 @@ def _simulate_window(df: pd.DataFrame, params: ParamSet, initial_balance: float 
 
                 if row["low"] <= open_trade.entry - 2.5 * open_trade.risk:
                     open_trade.realized_r += open_trade.remaining * 2.5
-                    pnl = balance * risk_per_trade * open_trade.realized_r
+                    pnl = balance * risk_fraction * open_trade.realized_r
                     trade_returns.append(pnl / max(balance, 1.0))
+                    trade_r_values.append(open_trade.realized_r)
                     balance += pnl
                     open_trade = None
                     continue
@@ -205,17 +261,20 @@ def _simulate_window(df: pd.DataFrame, params: ParamSet, initial_balance: float 
         if (i - last_entry_idx) < params.cooldown_bars:
             continue
 
-        bullish = row["close"] > row["ema50"]
-        bearish = row["close"] < row["ema50"]
-        ema_ok = row["ema_distance"] >= params.ema_distance_min
+        # Live-stack aligned gates: MTF confluence + regime + news + confidence.
+        mtf_buy = (row["m5_bias"] > 0) and (row["h1_bias"] > 0) and (row["h4_bias"] > 0)
+        mtf_sell = (row["m5_bias"] < 0) and (row["h1_bias"] < 0) and (row["h4_bias"] < 0)
+        regime_ok = float(row["adx14"]) >= params.regime_adx_min
+        news_ok = int(row.get("news_block", 0)) == 0
+        conf_ok = float(row.get("ai_confidence", 0.0)) >= params.confidence_min
 
-        buy_signal = bullish and ema_ok and (prev["rsi14"] <= params.rsi_buy)
-        sell_signal = bearish and ema_ok and (prev["rsi14"] >= params.rsi_sell)
+        buy_signal = mtf_buy and regime_ok and news_ok and conf_ok
+        sell_signal = mtf_sell and regime_ok and news_ok and conf_ok
 
         if not (buy_signal or sell_signal):
             continue
 
-        risk = max(float(row["atr14"] * 1.5), float(row["close"] * 0.0002))
+        risk = max(float(row["atr14"] * params.atr_sl_mult), float(row["close"] * 0.0002))
         if buy_signal:
             open_trade = TradeState(
                 direction="BUY",
@@ -241,8 +300,9 @@ def _simulate_window(df: pd.DataFrame, params: ParamSet, initial_balance: float 
         else:
             r_out = (open_trade.entry - last_price) / open_trade.risk
         open_trade.realized_r += open_trade.remaining * r_out
-        pnl = balance * risk_per_trade * open_trade.realized_r
+        pnl = balance * _kelly_fraction() * open_trade.realized_r
         trade_returns.append(pnl / max(balance, 1.0))
+        trade_r_values.append(open_trade.realized_r)
         balance += pnl
 
     if len(trade_returns) < 2:
@@ -250,7 +310,12 @@ def _simulate_window(df: pd.DataFrame, params: ParamSet, initial_balance: float 
     else:
         arr = np.array(trade_returns, dtype=float)
         std = float(np.std(arr, ddof=1))
-        sharpe = float((np.mean(arr) / std) * np.sqrt(252)) if std > 0 else 0.0
+        if std > 0:
+            duration_days = max(1.0, (df["time"].iloc[-1] - df["time"].iloc[0]).total_seconds() / 86400.0)
+            trades_per_year = max(1.0, (len(trade_returns) / duration_days) * 365.0)
+            sharpe = float((np.mean(arr) / std) * np.sqrt(trades_per_year))
+        else:
+            sharpe = 0.0
 
     return {
         "sharpe": round(sharpe, 6),
@@ -286,7 +351,7 @@ def _rolling_windows(from_dt: datetime, to_dt: datetime) -> list[tuple[datetime,
 
 def _stability_report(window_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for param in ["rsi_buy", "rsi_sell", "ema_distance_min", "cooldown_bars", "partial_close_r"]:
+    for param in ["confidence_min", "regime_adx_min", "cooldown_bars", "partial_close_r", "atr_sl_mult", "kelly_cap"]:
         values = window_df[param].astype(float)
         if values.empty:
             continue
@@ -314,7 +379,7 @@ def _render_stability_heatmap(window_df: pd.DataFrame, out_path: Path) -> None:
     if window_df.empty:
         return
 
-    params = ["rsi_buy", "rsi_sell", "ema_distance_min", "cooldown_bars", "partial_close_r"]
+    params = ["confidence_min", "regime_adx_min", "cooldown_bars", "partial_close_r", "atr_sl_mult", "kelly_cap"]
     matrix = []
     annotations = []
 
@@ -388,7 +453,7 @@ def run_walk_forward(symbol: str, from_dt: datetime, to_dt: datetime, output_dir
 
         for p in grid:
             in_sample = _simulate_window(train_df, p)
-            if in_sample["trades"] < 10:
+            if in_sample["trades"] < MIN_TRADES_PER_WINDOW:
                 continue
             score = float(in_sample["sharpe"])
             if score > best_train_sharpe:
@@ -410,11 +475,12 @@ def run_walk_forward(symbol: str, from_dt: datetime, to_dt: datetime, output_dir
                 "test_sharpe": out_sample["sharpe"],
                 "test_trades": out_sample["trades"],
                 "test_return_pct": out_sample["return_pct"],
-                "rsi_buy": best_params.rsi_buy,
-                "rsi_sell": best_params.rsi_sell,
-                "ema_distance_min": best_params.ema_distance_min,
+                "confidence_min": best_params.confidence_min,
+                "regime_adx_min": best_params.regime_adx_min,
                 "cooldown_bars": best_params.cooldown_bars,
                 "partial_close_r": best_params.partial_close_r,
+                "atr_sl_mult": best_params.atr_sl_mult,
+                "kelly_cap": best_params.kelly_cap,
             }
         )
 
@@ -441,6 +507,15 @@ def run_walk_forward(symbol: str, from_dt: datetime, to_dt: datetime, output_dir
         "symbol": symbol,
         "from": from_dt.isoformat(),
         "to": to_dt.isoformat(),
+        "strategy_validation_mode": "live_stack_proxy",
+        "gates_tested": [
+            "mtf_confluence_m5_h1_h4",
+            "regime_filter_adx",
+            "news_gate",
+            "confidence_gate",
+            "kelly_position_sizing",
+        ],
+        "min_trades_per_train_window": MIN_TRADES_PER_WINDOW,
         "windows_total": int(len(window_df)),
         "avg_test_sharpe": round(float(window_df["test_sharpe"].mean()), 4),
         "median_test_sharpe": round(float(window_df["test_sharpe"].median()), 4),
