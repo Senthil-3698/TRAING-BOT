@@ -28,6 +28,9 @@ PARTIAL_R_MIN = 1.2
 PARTIAL_R_MAX = 2.0
 PARTIAL_R_DEFAULT = 1.5
 AUTO_TUNE_CHECK_SECONDS = 300
+EXIT_SCAN_INTERVAL_SECONDS = 0.5
+BE_TRIGGER_POINTS = 50  # 5 pips = 50 points
+BE_LOCK_POINTS = 10     # 1 pip = 10 points
 
 
 def _get_tracked_trade(ticket):
@@ -395,9 +398,12 @@ def manage_exits():
 
             full_exit_r, runner_trail_r, trend_profile = _trend_exit_profile(float(trend_score))
 
-            shield_mode, risk_trigger_multiplier = get_market_volatility(symbol)
-            trigger_distance = risk_points * risk_trigger_multiplier
-            be_buffer = 10 * point
+            shield_mode, _ = get_market_volatility(symbol)
+            be_lock_distance = BE_LOCK_POINTS * point
+            if pos.type == mt5.ORDER_TYPE_BUY:
+                profit_points = (current_price - entry) / point
+            else:
+                profit_points = (entry - current_price) / point
 
             # Time-based hard exit for M1 scalps: no +1R within 45 min.
             timeframe = str(tracked_trade.get("timeframe", "1m")).lower()
@@ -419,20 +425,22 @@ def manage_exits():
                     print(f"STRUCTURE EXIT: {ticket} closed. {shift_reason}")
                 continue
             
-            # 2. Layer 1: Move to Breakeven (+1R)
+            # 2. Hyper-Aggressive Layer 1: move to break-even + 1 pip as soon as +5 pips are reached.
             if pos.type == mt5.ORDER_TYPE_BUY:
-                if current_price >= (entry + trigger_distance) and current_sl < entry:
-                    modify_sl(ticket, entry + be_buffer, pos.tp)
+                target_sl = entry + be_lock_distance
+                if profit_points > BE_TRIGGER_POINTS and current_sl < target_sl:
+                    modify_sl(ticket, target_sl, pos.tp)
                     update_trade_stage(ticket, "BREAKEVEN")
                     log_trade_event(ticket, "BE")
-                    print(f"Shield {shield_mode}: BUY {ticket} moved to breakeven.")
+                    print(f"Shield {shield_mode}: BUY {ticket} moved to BE+1pip at +{profit_points:.1f} points.")
             
             elif pos.type == mt5.ORDER_TYPE_SELL:
-                if current_price <= (entry - trigger_distance) and current_sl > entry:
-                    modify_sl(ticket, entry - be_buffer, pos.tp)
+                target_sl = entry - be_lock_distance
+                if profit_points > BE_TRIGGER_POINTS and ((current_sl == 0.0) or (current_sl > target_sl)):
+                    modify_sl(ticket, target_sl, pos.tp)
                     update_trade_stage(ticket, "BREAKEVEN")
                     log_trade_event(ticket, "BE")
-                    print(f"Shield {shield_mode}: SELL {ticket} moved to breakeven.")
+                    print(f"Shield {shield_mode}: SELL {ticket} moved to BE+1pip at +{profit_points:.1f} points.")
 
             # 3. Layer 2: Partial Close (auto-tuned R level)
             stage = _get_trade_stage(ticket, tracked_trade)
@@ -477,7 +485,7 @@ def manage_exits():
                         update_trade_stage(ticket, "TRAILING")
                         log_trade_event(ticket, f"TRAIL_UPDATE_{runner_trail_r}R_{trend_profile}")
 
-        time.sleep(1) # Check every second
+        time.sleep(EXIT_SCAN_INTERVAL_SECONDS)  # Hyper-aggressive scan cadence
 
 def modify_sl(ticket, new_sl, current_tp):
     position = mt5.positions_get(ticket=ticket)

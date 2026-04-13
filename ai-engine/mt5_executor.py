@@ -20,6 +20,9 @@ _mt5_initialized = False
 risk_engine = RiskEngine()
 quality_monitor = ExecutionQualityMonitor()
 
+HF_XAUUSD_SL_POINTS = 100  # 10 pips = 100 points
+HF_XAUUSD_TP_POINTS = 150  # 15 pips = 150 points
+
 
 def _initialize_mt5():
     """Initialize MT5 if not already initialized. Keeps persistent connection."""
@@ -205,6 +208,12 @@ def execute_trade(action, symbol, timeframe, lot_size=None, sl_pips=None, tp_pip
     Compatibility wrapper for autonomous scanners that expect execute_trade().
     Uses dynamic positioning by default (calculates lot based on ATR and account equity).
     """
+    # High-frequency scalping profile for XAUUSD: fixed, tight exits.
+    # Keep explicit points to avoid ambiguity between pip/point conventions.
+    if symbol == "XAUUSD":
+        sl_pips = HF_XAUUSD_SL_POINTS
+        tp_pips = HF_XAUUSD_TP_POINTS
+
     return execute_market_order(symbol, action, lot_size, sl_pips, tp_pips)
 
 
