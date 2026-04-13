@@ -4,6 +4,7 @@ import redis
 import json
 import os
 import httpx
+import threading
 from datetime import datetime, timezone
 
 import numpy as np
@@ -33,9 +34,12 @@ EXIT_SCAN_INTERVAL_SECONDS = 0.5
 BE_TRIGGER_POINTS = 50  # 5 pips = 50 points
 BE_LOCK_POINTS = 10     # 1 pip = 10 points
 BE_TRIGGER_ATR_MULTIPLE = 1.0
-SHADOW_TRIGGER_POINTS = 30  # 3 pips = 30 points
-SHADOW_TRAIL_POINTS = 20    # 2 pips = 20 points
-TIME_BOMB_SECONDS = 180     # 3 minutes
+# XAUUSD shadow trail: 100-150 points trigger (10-15 pips), 80-100 points trail (8-10 pips)
+SHADOW_TRIGGER_POINTS = 100  # ~10 pips for XAUUSD
+SHADOW_TRAIL_POINTS = 80     # ~8 pips for XAUUSD
+# TIME_BOMB: Only close if trade is at or below breakeven after this duration
+TIME_BOMB_SECONDS = 180      # 3 minutes
+TIME_BOMB_BE_TOLERANCE_POINTS = 20  # Allow up to +2 pips before force-close
 
 
 def _get_tracked_trade(ticket):
@@ -303,37 +307,36 @@ def get_market_volatility(symbol):
     return "NORMAL", 1.0
 
 
-def log_trade_event(ticket, event_type):
-    payload = {
-        "ticketId": str(ticket),
-        "eventType": event_type,
-    }
-
+def _send_event_async(ticket, event_type):
+    """Fire-and-forget event logging to prevent blocking exit loop."""
     try:
-        httpx.post("http://localhost:8080/events", json=payload, timeout=5.0)
+        payload = {
+            "ticketId": str(ticket),
+            "eventType": event_type,
+        }
+        httpx.post("http://localhost:8080/events", json=payload, timeout=2.0)
         event_key = str(event_type).upper()
         if event_key == "ENTRY":
             send_telegram_alert(
                 "TRADE_ENTRY",
-                "Trade entry event logged.",
+                f"Trade entry event logged (ticket={ticket}).",
                 level="INFO",
                 extra={"ticket": ticket, "event_type": event_key},
             )
         elif event_key in {"EXIT", "EOD", "TIME_EXPIRED", "SL", "TP", "TRAIL_SL", "FULL_EXIT", "PARTIAL_CLOSE"}:
             send_telegram_alert(
                 "TRADE_EXIT",
-                "Trade exit event logged.",
+                f"Trade exit event logged: {event_key}.",
                 level="INFO",
                 extra={"ticket": ticket, "event_type": event_key},
             )
-    except httpx.HTTPError as error:
-        print(f"EVENT LOG FAILED for {ticket}: {error}")
-        send_telegram_alert(
-            "SYSTEM_ERROR",
-            "Failed to log trade event to execution engine.",
-            level="ERROR",
-            extra={"ticket": ticket, "event_type": event_type, "error": str(error)},
-        )
+    except Exception as error:
+        print(f"[EVENT LOG ASYNC FAILED] {ticket}: {error}")
+
+def log_trade_event(ticket, event_type):
+    """Non-blocking wrapper: dispatch event logging on background thread."""
+    thread = threading.Thread(target=_send_event_async, args=(ticket, event_type), daemon=True)
+    thread.start()
 
 def manage_exits():
     if not mt5.initialize():
@@ -350,32 +353,46 @@ def manage_exits():
             current_sl = float(pos.sl or 0.0)
             tp = float(pos.tp or 0.0)
 
-            opened_at_epoch = float(getattr(pos, "time", 0) or 0)
-            open_seconds = max(0.0, time.time() - opened_at_epoch) if opened_at_epoch > 0 else 0.0
-            if open_seconds >= TIME_BOMB_SECONDS:
-                if _close_position_market(ticket):
-                    update_trade_stage(ticket, "TIME_EXPIRED")
-                    log_trade_event(ticket, "TIME_EXPIRED")
-                    send_telegram_alert(
-                        "TRADE_EXIT",
-                        "Position closed by time-bomb safety rule.",
-                        level="INFO",
-                        extra={"ticket": ticket, "symbol": symbol, "reason": "TIME_EXPIRED"},
-                    )
-                    print("[TIME EXPIRED] Closing stagnant position to free up margin.")
-                else:
-                    print(f"[TIME EXPIRED] Failed to close stagnant position {ticket}.")
-                    send_telegram_alert(
-                        "TRADE_ERROR",
-                        "Failed to close position on time-bomb trigger.",
-                        level="ERROR",
-                        extra={"ticket": ticket, "symbol": symbol},
-                    )
-                continue
-
+            # Get symbol info early for use in all checks
             symbol_info = mt5.symbol_info(symbol)
             if symbol_info is None or symbol_info.point <= 0:
                 continue
+
+            opened_at_epoch = float(getattr(pos, "time", 0) or 0)
+            open_seconds = max(0.0, time.time() - opened_at_epoch) if opened_at_epoch > 0 else 0.0
+            
+            # TIME_BOMB: Only close if trade is at or below breakeven after TIME_BOMB_SECONDS
+            if open_seconds >= TIME_BOMB_SECONDS:
+                pnl_usd = float(pos.profit) if hasattr(pos, 'profit') and pos.profit is not None else 0.0
+                # Convert USD P&L to points: pnl_usd / (point_value * contract_size)
+                point_value = symbol_info.point
+                contract_size = symbol_info.trade_contract_size or 100.0
+                pnl_points = pnl_usd / (point_value * contract_size) if (point_value * contract_size) > 0 else 0.0
+                
+                # Close only if breakeven or losing (pnl <= tolerance threshold)
+                if pnl_points <= TIME_BOMB_BE_TOLERANCE_POINTS:
+                    if _close_position_market(ticket):
+                        update_trade_stage(ticket, "TIME_EXPIRED")
+                        log_trade_event(ticket, "TIME_EXPIRED")
+                        send_telegram_alert(
+                            "TRADE_EXIT",
+                            f"Position closed: {open_seconds:.0f}s stagnant, {pnl_points:.1f} points pnl (<=breakeven).",
+                            level="INFO",
+                            extra={"ticket": ticket, "symbol": symbol, "reason": "TIME_EXPIRED", "seconds": open_seconds, "pnl_points": pnl_points},
+                        )
+                        print(f"[TIME EXPIRED] {ticket} closed after {open_seconds:.0f}s, pnl={pnl_points:.1f} points")
+                    else:
+                        print(f"[TIME EXPIRED] Failed to close stagnant position {ticket}.")
+                        send_telegram_alert(
+                            "TRADE_ERROR",
+                            f"Failed to close stagnant position after {open_seconds:.0f}s.",
+                            level="ERROR",
+                            extra={"ticket": ticket, "symbol": symbol},
+                        )
+                    continue
+                else:
+                    # Trade is profitable, don't force-close even though it's been open > 3 min
+                    print(f"[TIME BOMB SKIP] {ticket} profitable at {pnl_points:.1f} points, allowing to run")
 
             point = symbol_info.point
             be_lock_distance = BE_LOCK_POINTS * point
@@ -419,6 +436,30 @@ def manage_exits():
                         update_trade_stage(ticket, "TRAILING")
                         log_trade_event(ticket, "SHADOW_TRAIL")
                         print(f"[SHADOW] SELL {ticket} trailed to {proposed_sl:.2f}")
+
+            # PARTIAL CLOSE: Execute if position has reached target R-multiple
+            try:
+                partial_r_multiple = _get_partial_r_multiple()
+                tracked = _get_tracked_trade(ticket)
+                if tracked and tracked.get('stop_loss_pips') and tracked.get('stop_loss_pips') > 0:
+                    risk_points = tracked['stop_loss_pips'] * symbol_info.point
+                    r_progress = _r_progress(pos.type, entry, current_price, risk_points)
+                    
+                    # If position has reached partial close R-multiple threshold
+                    if r_progress >= partial_r_multiple:
+                        result = partial_close_position(ticket, percentage=0.5)
+                        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                            update_trade_stage(ticket, "PARTIAL")
+                            log_trade_event(ticket, "PARTIAL_CLOSE")
+                            send_telegram_alert(
+                                "TRADE_EXIT",
+                                f"Partial close: {ticket} @ {r_progress:.2f}R (target={partial_r_multiple:.2f}R)",
+                                level="INFO",
+                                extra={"ticket": ticket, "symbol": symbol, "r_progress": r_progress},
+                            )
+                            print(f"[PARTIAL] {ticket} @ {r_progress:.2f}R, 50% closed")
+            except Exception as e:
+                print(f"[PARTIAL CLOSE ERROR] {ticket}: {e}")
 
         time.sleep(EXIT_SCAN_INTERVAL_SECONDS)
 
