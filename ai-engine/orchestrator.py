@@ -50,41 +50,20 @@ async def on_signal_received(signal):
     signal["market_regime"] = regime_context.get("regime", "UNKNOWN")
     signal["regime_context"] = regime_context
 
-    # 1. Check Technical Confluence (The Filter)
-    trend = get_integrated_bias(symbol)
-    if trend != "NO_CONFLUENCE" and action != trend:
-        rejection_reason = f"Counter-trend signal ignored: {action} against {trend} trend."
-        print(rejection_reason)
-        journal.log_signal(
-            source=signal.get("source", "orchestrator"),
-            symbol=symbol,
-            action=action,
-            timeframe=tf,
-            signal_ts=_signal_ts(signal),
-            **_indicators(signal),
-            ai_decision="REJECTED",
-            ai_reasoning=rejection_reason,
-            ai_confidence=signal.get("confidence_score"),
-            decision_status="REJECTED",
-            rejection_reason=rejection_reason,
-            metadata={"stage": "trend_filter", "regime": regime_context},
-        )
-        return
+    bypass_ai_news_gate = os.getenv("BYPASS_AI_NEWS_GATE", "1") == "1"
+    ai_structured = None
 
-    # 2. Get Global Context (The News)
-    news_context = await fetch_macro_news()
-
-    # 2b. Intermarket context for gold (DXY, real yield proxy, SPX/VIX risk regime)
-    if symbol == "XAUUSD":
-        intermarket_context = get_intermarket_context()
-        dxy_block_long = action == "BUY" and intermarket_context.get("dxy_breakout_up")
-        dxy_block_short = action == "SELL" and intermarket_context.get("dxy_breakout_down")
-        if dxy_block_long or dxy_block_short:
-            rejection_reason = (
-                "Intermarket veto: DXY breakout up blocks gold longs."
-                if dxy_block_long
-                else "Intermarket veto: DXY breakout down blocks gold shorts."
-            )
+    if bypass_ai_news_gate:
+        decision = "APPROVED"
+        reason = "HFT fast-path: AI/news/intermarket gate bypassed."
+        ai_confidence = signal.get("confidence_score")
+        ai_context = "BYPASS_AI_NEWS_GATE=1"
+        print("[ORCHESTRATOR] HFT bypass active: dispatching without AI/news gate.")
+    else:
+        # 1. Check Technical Confluence (The Filter)
+        trend = get_integrated_bias(symbol)
+        if trend != "NO_CONFLUENCE" and action != trend:
+            rejection_reason = f"Counter-trend signal ignored: {action} against {trend} trend."
             print(rejection_reason)
             journal.log_signal(
                 source=signal.get("source", "orchestrator"),
@@ -93,66 +72,96 @@ async def on_signal_received(signal):
                 timeframe=tf,
                 signal_ts=_signal_ts(signal),
                 **_indicators(signal),
-                news_context=news_context,
                 ai_decision="REJECTED",
                 ai_reasoning=rejection_reason,
                 ai_confidence=signal.get("confidence_score"),
                 decision_status="REJECTED",
                 rejection_reason=rejection_reason,
-                metadata={"stage": "intermarket_dxy", "intermarket": intermarket_context},
+                metadata={"stage": "trend_filter", "regime": regime_context},
             )
             return
 
-    ai_context = news_context
-    regime_summary = (
-        f"REGIME_CONTEXT: regime={regime_context.get('regime')} reason={regime_context.get('reason')} "
-        f"features={regime_context.get('features')}"
-    )
-    ai_context = f"{ai_context}\n{regime_summary}"
-    if intermarket_context:
-        ai_context = f"{news_context}\nINTERMARKET_CONTEXT: {intermarket_context.get('summary', '')}"
+        # 2. Get Global Context (The News)
+        news_context = await fetch_macro_news()
+
+        # 2b. Intermarket context for gold (DXY, real yield proxy, SPX/VIX risk regime)
+        if symbol == "XAUUSD":
+            intermarket_context = get_intermarket_context()
+            dxy_block_long = action == "BUY" and intermarket_context.get("dxy_breakout_up")
+            dxy_block_short = action == "SELL" and intermarket_context.get("dxy_breakout_down")
+            if dxy_block_long or dxy_block_short:
+                rejection_reason = (
+                    "Intermarket veto: DXY breakout up blocks gold longs."
+                    if dxy_block_long
+                    else "Intermarket veto: DXY breakout down blocks gold shorts."
+                )
+                print(rejection_reason)
+                journal.log_signal(
+                    source=signal.get("source", "orchestrator"),
+                    symbol=symbol,
+                    action=action,
+                    timeframe=tf,
+                    signal_ts=_signal_ts(signal),
+                    **_indicators(signal),
+                    news_context=news_context,
+                    ai_decision="REJECTED",
+                    ai_reasoning=rejection_reason,
+                    ai_confidence=signal.get("confidence_score"),
+                    decision_status="REJECTED",
+                    rejection_reason=rejection_reason,
+                    metadata={"stage": "intermarket_dxy", "intermarket": intermarket_context},
+                )
+                return
+
+        ai_context = news_context
+        regime_summary = (
+            f"REGIME_CONTEXT: regime={regime_context.get('regime')} reason={regime_context.get('reason')} "
+            f"features={regime_context.get('features')}"
+        )
         ai_context = f"{ai_context}\n{regime_summary}"
+        if intermarket_context:
+            ai_context = f"{news_context}\nINTERMARKET_CONTEXT: {intermarket_context.get('summary', '')}"
+            ai_context = f"{ai_context}\n{regime_summary}"
 
-    bypass_ai_for_tick_scalper = os.getenv("BYPASS_AI_FOR_TICK_SCALPER", "1") == "1"
-    is_tick_fastpath = (str(tf).lower() == "tick") and (setup_type == "TICK_EMA_CROSS_SCALP")
+        bypass_ai_for_tick_scalper = os.getenv("BYPASS_AI_FOR_TICK_SCALPER", "1") == "1"
+        is_tick_fastpath = (str(tf).lower() == "tick") and (setup_type == "TICK_EMA_CROSS_SCALP")
 
-    if bypass_ai_for_tick_scalper and is_tick_fastpath:
-        decision = "APPROVED"
-        reason = "Tick fast-path approval (AI bypass enabled)."
-        ai_confidence = signal.get("confidence_score")
-        ai_structured = {
-            "primary_thesis": "Tick EMA momentum fast path",
-            "top_3_risks": None,
-            "invalidation_level": None,
-            "expected_hold_time_minutes": 2,
-            "suggested_size_multiplier_0_to_1": 1.0,
-        }
-        print("[ORCHESTRATOR] AI bypass active for tick scalper signal.")
-    else:
-        # 3. AI Final Veto (The Strategist)
-        ai_result = await validate_with_ai({
-            **signal,
-            "context": ai_context,
-            "intermarket_context": intermarket_context,
-            "market_regime": regime_context.get("regime"),
-            "regime_context": regime_context,
-        }, macro_bias=trend) or {}
-
-        if isinstance(ai_result, dict):
-            decision = ai_result.get("decision", "REJECTED")
-            reason = ai_result.get("reason", ai_result.get("reasoning", ""))
-            ai_confidence = ai_result.get("confidence", signal.get("confidence_score"))
-            ai_structured = {
-                "primary_thesis": ai_result.get("primary_thesis"),
-                "top_3_risks": ai_result.get("top_3_risks"),
-                "invalidation_level": ai_result.get("invalidation_level"),
-                "expected_hold_time_minutes": ai_result.get("expected_hold_time_minutes"),
-                "suggested_size_multiplier_0_to_1": ai_result.get("suggested_size_multiplier_0_to_1"),
-            }
-        else:
-            decision, reason = ai_result
+        if bypass_ai_for_tick_scalper and is_tick_fastpath:
+            decision = "APPROVED"
+            reason = "Tick fast-path approval (AI bypass enabled)."
             ai_confidence = signal.get("confidence_score")
-            ai_structured = None
+            ai_structured = {
+                "primary_thesis": "Tick EMA momentum fast path",
+                "top_3_risks": None,
+                "invalidation_level": None,
+                "expected_hold_time_minutes": 2,
+                "suggested_size_multiplier_0_to_1": 1.0,
+            }
+            print("[ORCHESTRATOR] AI bypass active for tick scalper signal.")
+        else:
+            # 3. AI Final Veto (The Strategist)
+            ai_result = await validate_with_ai({
+                **signal,
+                "context": ai_context,
+                "intermarket_context": intermarket_context,
+                "market_regime": regime_context.get("regime"),
+                "regime_context": regime_context,
+            }, macro_bias=trend) or {}
+
+            if isinstance(ai_result, dict):
+                decision = ai_result.get("decision", "REJECTED")
+                reason = ai_result.get("reason", ai_result.get("reasoning", ""))
+                ai_confidence = ai_result.get("confidence", signal.get("confidence_score"))
+                ai_structured = {
+                    "primary_thesis": ai_result.get("primary_thesis"),
+                    "top_3_risks": ai_result.get("top_3_risks"),
+                    "invalidation_level": ai_result.get("invalidation_level"),
+                    "expected_hold_time_minutes": ai_result.get("expected_hold_time_minutes"),
+                    "suggested_size_multiplier_0_to_1": ai_result.get("suggested_size_multiplier_0_to_1"),
+                }
+            else:
+                decision, reason = ai_result
+                ai_confidence = signal.get("confidence_score")
 
     if isinstance(decision, str) and decision.upper() in {"APPROVED", "REJECTED"}:
         decision = decision.upper()

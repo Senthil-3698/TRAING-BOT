@@ -107,11 +107,11 @@ def analyze_and_trade() -> None:
     max_positions = 5
 
     print("[SCANNER] RUBBER BAND ENGINE ACTIVATED")
-    print("[CONFIG] Mean Reversion: Bollinger(20,2) + RSI(2)")
-    print("[CONFIG] BUY: tick < LowerBand and RSI2 < 10 | SELL: tick > UpperBand and RSI2 > 90")
+    print("[CONFIG] Mean Reversion: Bollinger(20,1) + RSI(2)")
+    print("[CONFIG] BUY: tick < LowerBand and RSI2 < 30 | SELL: tick > UpperBand and RSI2 > 70")
     print(f"[CONFIG] Spread Shield: <={MAX_SCALP_SPREAD_POINTS:.1f} points | Max Positions: 5 | Poll: 1.0s")
     print()
-    last_heartbeat = 0.0
+    last_telemetry = 0.0
 
     while True:
         try:
@@ -129,8 +129,8 @@ def analyze_and_trade() -> None:
                 time.sleep(1.0)
                 continue
 
-            bb_upper = float(bb_mid + (2.0 * bb_std))
-            bb_lower = float(bb_mid - (2.0 * bb_std))
+            bb_upper = float(bb_mid + (1.0 * bb_std))
+            bb_lower = float(bb_mid - (1.0 * bb_std))
 
             delta = close.diff()
             gain = delta.clip(lower=0.0)
@@ -152,22 +152,18 @@ def analyze_and_trade() -> None:
                 continue
             current_price = float((tick.bid + tick.ask) / 2.0)
 
-            buy_signal = current_price < bb_lower and rsi2 < 10.0
-            sell_signal = current_price > bb_upper and rsi2 > 90.0
+            buy_signal = current_price < bb_lower and rsi2 < 30.0
+            sell_signal = current_price > bb_upper and rsi2 > 70.0
             signal_action = "BUY" if buy_signal else "SELL" if sell_signal else None
 
+            now = time.time()
+            if (now - last_telemetry) >= 5.0:
+                print(
+                    f"[TELEMETRY] Price={current_price:.2f} BB_L={bb_lower:.2f} BB_U={bb_upper:.2f} RSI2={rsi2:.1f}"
+                )
+                last_telemetry = now
+
             if signal_action is None:
-                now = time.time()
-                if (now - last_heartbeat) >= 1.0:
-                    info = mt5.symbol_info(symbol)
-                    spread_points = ((tick.ask - tick.bid) / info.point) if tick and info and info.point else None
-                    spread_txt = f"{spread_points:.1f}" if spread_points is not None else "NA"
-                    spread_ok = spread_points is not None and spread_points <= MAX_SCALP_SPREAD_POINTS
-                    print(
-                        f"[WAIT] No snap-back | Price={current_price:.2f} BB_L={bb_lower:.2f} BB_U={bb_upper:.2f} "
-                        f"RSI2={rsi2:.1f} Spread={spread_txt} ({'OK' if spread_ok else 'HIGH'})"
-                    )
-                    last_heartbeat = now
                 time.sleep(1.0)
                 continue
 
@@ -183,12 +179,14 @@ def analyze_and_trade() -> None:
                 if not spread_pass:
                     rejection_reasons.append(spread_reason)
 
+                signal_ts_value = tick_time.to_pydatetime() if hasattr(tick_time, "to_pydatetime") else tick_time
+
                 journal.log_signal(
                     source="autonomous_scanner",
                     symbol=symbol,
                     action=signal_action,
                     timeframe="1m",
-                    signal_ts=tick_time.to_pydatetime(),
+                    signal_ts=signal_ts_value,
                     rsi_value=float(rsi2),
                     ema_distance=None,
                     atr_value=None,
