@@ -27,10 +27,10 @@ def _safe_set(key, value):
 
 def auto_update_bias(symbol):
     """
-    Reads live H1 and H4 candles from MT5, computes EMA50 on each,
+    Reads live H1, H4, and D1 candles from MT5, computes EMA50 on each,
     and writes the resulting bias to Redis. Call this before checking
     get_integrated_bias() so the filter is always current.
-    Returns the computed (h1_bias, h4_bias) tuple.
+    Returns the computed (h1_bias, h4_bias, d1_bias) tuple.
     """
     try:
         import MetaTrader5 as mt5
@@ -38,6 +38,7 @@ def auto_update_bias(symbol):
         _TF_MAP = {
             "1h": mt5.TIMEFRAME_H1,
             "4h": mt5.TIMEFRAME_H4,
+            "1d": mt5.TIMEFRAME_D1,
         }
 
         results = {}
@@ -64,11 +65,11 @@ def auto_update_bias(symbol):
 
             set_market_bias(symbol, label, results[label])
 
-        return results.get("1h", "NEUTRAL"), results.get("4h", "NEUTRAL")
+        return results.get("1h", "NEUTRAL"), results.get("4h", "NEUTRAL"), results.get("1d", "NEUTRAL")
 
     except Exception as e:
         print(f"[BIAS] auto_update_bias failed: {e}")
-        return "NEUTRAL", "NEUTRAL"
+        return "NEUTRAL", "NEUTRAL", "NEUTRAL"
 
 
 def set_market_bias(symbol, timeframe, bias):
@@ -82,16 +83,18 @@ def set_market_bias(symbol, timeframe, bias):
 
 def get_integrated_bias(symbol):
     """
-    The Scalper's Filter: Checks if 1h and 4h are aligned.
+    The Scalper's Filter: Checks if 1h, 4h, and 1d are aligned.
     """
     h1 = _safe_get(f"{symbol}:1h:bias")
     h4 = _safe_get(f"{symbol}:4h:bias")
+    d1 = _safe_get(f"{symbol}:1d:bias")
     
     # Decodes bytes to string if they exist
     h1 = h1.decode('utf-8') if h1 else "NEUTRAL"
     h4 = h4.decode('utf-8') if h4 else "NEUTRAL"
+    d1 = d1.decode('utf-8') if d1 else "NEUTRAL"
     
-    if h1 == h4 and h1 != "NEUTRAL":
+    if h1 == h4 == d1 and h1 != "NEUTRAL":
         return h1 # Strong Trend
     return "NO_CONFLUENCE"
 

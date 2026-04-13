@@ -68,8 +68,10 @@ class RiskEngine:
         self.kill_switch_key = os.getenv("GLOBAL_KILL_SWITCH_KEY", "GLOBAL_KILL_SWITCH")
         self.daily_loss_limit_pct = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.03"))
         self.weekly_loss_limit_pct = float(os.getenv("WEEKLY_LOSS_LIMIT_PCT", "0.06"))
+        self.daily_drawdown_limit_pct = float(os.getenv("DAILY_DRAWDOWN_CIRCUIT_BREAKER_PCT", "0.03"))
         self.max_consecutive_losses = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
         self.cooldown_hours = int(os.getenv("LOSS_COOLDOWN_HOURS", "2"))
+        self.max_concurrent_positions = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
         self.max_correlated_positions = int(os.getenv("MAX_CORRELATED_POSITIONS", "2"))
         self.news_blackout_minutes = int(os.getenv("NEWS_BLACKOUT_MINUTES", "15"))
         self.spread_lookback = int(os.getenv("SPREAD_LOOKBACK", "20"))
@@ -82,6 +84,7 @@ class RiskEngine:
         }
 
         self.correlation_groups = self._load_correlation_groups()
+        self.blocked_correlated_long_pairs = self._load_blocked_correlated_long_pairs()
 
     def _load_correlation_groups(self) -> list[set[str]]:
         raw = os.getenv("CORRELATED_SYMBOL_GROUPS", "XAUUSD,GOLD,XAUUSDm,XAUUSD.pro")
@@ -91,6 +94,25 @@ class RiskEngine:
             if symbols:
                 groups.append(symbols)
         return groups
+
+    def _load_blocked_correlated_long_pairs(self) -> list[tuple[str, str]]:
+        raw = os.getenv("BLOCKED_CORRELATED_LONG_PAIRS", "EURUSD:GBPUSD")
+        pairs: list[tuple[str, str]] = []
+        for chunk in raw.split(","):
+            part = chunk.strip().upper()
+            if not part:
+                continue
+            if ":" in part:
+                left, right = part.split(":", 1)
+            elif "-" in part:
+                left, right = part.split("-", 1)
+            else:
+                continue
+            left = left.strip()
+            right = right.strip()
+            if left and right and left != right:
+                pairs.append((left, right))
+        return pairs
 
     def _ensure_mt5(self) -> bool:
         if mt5.terminal_info() is not None:
@@ -187,6 +209,20 @@ class RiskEngine:
             return False, None
         return now < until, until
 
+    def _daily_circuit_breaker_active(self, now: datetime) -> tuple[bool, datetime | None]:
+        raw = self.redis.get("risk:daily_circuit_breaker_until")
+        if not raw:
+            return False, None
+        try:
+            until = datetime.fromisoformat(raw.decode("utf-8"))
+        except ValueError:
+            return False, None
+        return now < until, until
+
+    def _set_daily_circuit_breaker(self, until: datetime, context: dict[str, Any]) -> None:
+        self.redis.set("risk:daily_circuit_breaker_until", until.isoformat())
+        self.redis.set("risk:daily_circuit_breaker_reason", json.dumps(context, default=str))
+
     def _set_cooldown(self, until: datetime) -> None:
         self.redis.set("risk:cooldown_until", until.isoformat())
 
@@ -207,6 +243,34 @@ class RiskEngine:
             and getattr(p, "magic", 0) in self.bot_magic_ids
         ]
         return len(correlated)
+
+    def _open_bot_positions(self):
+        positions = mt5.positions_get() or []
+        return [p for p in positions if getattr(p, "magic", 0) in self.bot_magic_ids]
+
+    def _count_open_bot_positions(self) -> int:
+        return len(self._open_bot_positions())
+
+    def _violates_directional_correlation(self, symbol: str, action: str) -> tuple[bool, dict[str, Any]]:
+        normalized_symbol = symbol.upper()
+        normalized_action = action.upper()
+        if normalized_action != "BUY":
+            return False, {}
+
+        positions = self._open_bot_positions()
+        open_long_symbols = {
+            getattr(p, "symbol", "").upper()
+            for p in positions
+            if getattr(p, "type", None) == mt5.POSITION_TYPE_BUY
+        }
+
+        for a, b in self.blocked_correlated_long_pairs:
+            if normalized_symbol == a and b in open_long_symbols:
+                return True, {"requested_symbol": a, "blocked_with": b, "action": "BUY"}
+            if normalized_symbol == b and a in open_long_symbols:
+                return True, {"requested_symbol": b, "blocked_with": a, "action": "BUY"}
+
+        return False, {}
 
     def _high_impact_events(self) -> list[datetime]:
         events: list[datetime] = []
@@ -361,6 +425,71 @@ class RiskEngine:
                 source=source,
             )
 
+        daily_breaker_on, daily_breaker_until = self._daily_circuit_breaker_active(now)
+        if daily_breaker_on:
+            return self._reject(
+                code="DAILY_DRAWDOWN_CIRCUIT_BREAKER",
+                message=f"Daily drawdown circuit breaker active until {daily_breaker_until.isoformat()}.",
+                symbol=symbol,
+                action=action,
+                timeframe=timeframe,
+                source=source,
+            )
+
+        account = mt5.account_info()
+        current_equity = float(account.equity) if account else 0.0
+        daily_drawdown_pct = 0.0
+        if day_balance > 0 and current_equity > 0:
+            daily_drawdown_pct = max(0.0, (day_balance - current_equity) / day_balance)
+
+        if day_balance > 0 and daily_drawdown_pct >= self.daily_drawdown_limit_pct:
+            midnight_reset = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+            context = {
+                "triggered_at": now.isoformat(),
+                "reset_at": midnight_reset.isoformat(),
+                "day_start_balance": day_balance,
+                "current_equity": current_equity,
+                "drawdown_pct": daily_drawdown_pct,
+                "threshold_pct": self.daily_drawdown_limit_pct,
+            }
+            self._set_daily_circuit_breaker(midnight_reset, context)
+            return self._reject(
+                code="DAILY_DRAWDOWN_CIRCUIT_BREAKER",
+                message="Daily drawdown exceeded limit; trading halted until midnight UTC reset.",
+                symbol=symbol,
+                action=action,
+                timeframe=timeframe,
+                source=source,
+                details=context,
+            )
+
+        open_positions_count = self._count_open_bot_positions()
+        if open_positions_count >= self.max_concurrent_positions:
+            return self._reject(
+                code="MAX_CONCURRENT_POSITIONS",
+                message="Max concurrent open positions reached.",
+                symbol=symbol,
+                action=action,
+                timeframe=timeframe,
+                source=source,
+                details={
+                    "open_positions": open_positions_count,
+                    "limit": self.max_concurrent_positions,
+                },
+            )
+
+        corr_violation, corr_details = self._violates_directional_correlation(symbol, action)
+        if corr_violation:
+            return self._reject(
+                code="CORRELATED_LONG_BLOCK",
+                message="Blocked correlated long exposure (EURUSD/GBPUSD policy).",
+                symbol=symbol,
+                action=action,
+                timeframe=timeframe,
+                source=source,
+                details=corr_details,
+            )
+
         consecutive_losses, last_loss_time = self._consecutive_losses()
         if consecutive_losses >= self.max_consecutive_losses and last_loss_time is not None:
             until = last_loss_time + timedelta(hours=self.cooldown_hours)
@@ -429,6 +558,8 @@ class RiskEngine:
                 "consecutive_losses": consecutive_losses,
                 "day_pnl": day_pnl,
                 "week_pnl": week_pnl,
+                "daily_drawdown_pct": daily_drawdown_pct,
+                "open_positions": open_positions_count,
             },
         )
 

@@ -1,6 +1,6 @@
 # BASELINE Backtest Report (XAUUSD, 12 Months)
 
-Run directory: ..\backtest_results\2025-04-13__2026-04-13__8f397063
+Run directory: backtest_results\2025-04-13__2026-04-13__8f397063
 
 ## Headline Stats
 | Metric | Value |
@@ -86,3 +86,28 @@ Sparkline:
 | TRAIL_SL | (1R, 2R] | 140 | 140 |
 | TRAIL_SL | <= -1R | 8 | 0 |
 | TRAIL_SL | > 2R | 114 | 114 |
+
+## Walk-Forward Optimization (70/30)
+| Metric | Value |
+| --- | --- |
+| In-sample Split | 70.0% |
+| Out-of-sample Split | 30.0% |
+| In-sample Trades | 1053 |
+| Out-of-sample Trades | 451 |
+| In-sample Sharpe | -0.528622 |
+| Out-of-sample Sharpe | 0.77726 |
+| OOS Drop vs IS % | 47.0352 |
+| Flag OOS Drop > 30% | True |
+
+## Monte Carlo Sharpe Stability (1000 Iterations)
+| Metric | Value |
+| --- | --- |
+| Iterations | 1000.0 |
+| Sample Size (Trades) | 1504.0 |
+| Base Sharpe | -0.39496 |
+| MC Mean Sharpe | -0.351883 |
+| MC Std Sharpe | 0.387475 |
+| MC P05 Sharpe | -0.892505 |
+| MC P50 Sharpe | -0.400278 |
+| MC P95 Sharpe | 0.400446 |
+| P(Sharpe > 0) | 0.166 |

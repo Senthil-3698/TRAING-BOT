@@ -2,12 +2,13 @@ import asyncio
 import httpx
 import os
 from datetime import datetime, timezone
-from state_manager import get_integrated_bias, track_active_trade
+from state_manager import auto_update_bias, get_integrated_bias, track_active_trade
 from news_aggregator import fetch_macro_news
 from strategist import validate_with_ai
 from trade_journal import TradeJournal
 from intermarket import get_intermarket_context
 from regime_detector import get_current_regime
+from alerts import send_telegram_alert
 
 EXECUTION_ENGINE_URL = os.getenv("EXECUTION_ENGINE_URL", "http://localhost:8081/execute")
 journal = TradeJournal()
@@ -60,6 +61,10 @@ async def on_signal_received(signal):
     if bypass_ai_news_gate:
         decision = "APPROVED"
         reason = "HFT fast-path: AI/news/intermarket gate bypassed."
+        try:
+            auto_update_bias(symbol)
+        except Exception as error:
+            print(f"[ORCHESTRATOR] Bias refresh skipped: {error}")
         ai_confidence = signal.get("confidence_score")
         ai_context = "BYPASS_AI_NEWS_GATE=1"
         print("[ORCHESTRATOR] HFT bypass active: dispatching without AI/news gate.")
@@ -167,6 +172,46 @@ async def on_signal_received(signal):
                 decision, reason = ai_result
                 ai_confidence = signal.get("confidence_score")
 
+    confidence_score = float(signal.get("confidence_score") or 0.0)
+    if confidence_score <= 70.0:
+        reason = f"Confidence gate: {confidence_score:.1f} <= 70.0"
+        print(reason)
+        journal.log_signal(
+            source=signal.get("source", "orchestrator"),
+            symbol=symbol,
+            action=action,
+            timeframe=tf,
+            signal_ts=_signal_ts(signal),
+            **_indicators(signal),
+            ai_decision="REJECTED",
+            ai_reasoning=reason,
+            ai_confidence=confidence_score,
+            decision_status="REJECTED",
+            rejection_reason=reason,
+            metadata={"stage": "confidence_gate", "regime": regime_context},
+        )
+        return
+
+    trend = get_integrated_bias(symbol)
+    if trend == "NO_CONFLUENCE" or action != trend:
+        reason = f"Higher-timeframe confluence not aligned: action={action}, bias={trend}"
+        print(reason)
+        journal.log_signal(
+            source=signal.get("source", "orchestrator"),
+            symbol=symbol,
+            action=action,
+            timeframe=tf,
+            signal_ts=_signal_ts(signal),
+            **_indicators(signal),
+            ai_decision="REJECTED",
+            ai_reasoning=reason,
+            ai_confidence=confidence_score,
+            decision_status="REJECTED",
+            rejection_reason=reason,
+            metadata={"stage": "mtf_confluence", "regime": regime_context, "bias": trend},
+        )
+        return
+
     if isinstance(decision, str) and decision.upper() in {"APPROVED", "REJECTED"}:
         decision = decision.upper()
 
@@ -179,7 +224,7 @@ async def on_signal_received(signal):
             "symbol": symbol,
             "action": action,
             "timeframe": tf,
-            "confidenceScore": signal.get("confidence_score", 0),
+            "confidenceScore": confidence_score,
             "signal_timestamp": signal.get("timestamp"),
             "signal_bar_time": signal.get("signal_bar_time"),
             "signal_bar_relation": signal.get("signal_bar_relation"),
@@ -244,6 +289,12 @@ async def on_signal_received(signal):
             elif response.status_code == 403:
                 print("SENTINEL_BLOCK")
                 rejection_reason = "Execution engine blocked request (403)."
+                send_telegram_alert(
+                    "TRADE_ERROR",
+                    "Execution engine blocked request.",
+                    level="ERROR",
+                    extra={"symbol": symbol, "action": action, "status_code": response.status_code},
+                )
                 journal.log_signal(
                     source=signal.get("source", "orchestrator"),
                     symbol=symbol,
@@ -262,6 +313,12 @@ async def on_signal_received(signal):
             else:
                 print(f"Execution engine returned {response.status_code}: {response.text}")
                 rejection_reason = f"Execution engine error {response.status_code}"
+                send_telegram_alert(
+                    "TRADE_ERROR",
+                    "Execution engine returned non-success status.",
+                    level="ERROR",
+                    extra={"symbol": symbol, "action": action, "status_code": response.status_code},
+                )
                 journal.log_signal(
                     source=signal.get("source", "orchestrator"),
                     symbol=symbol,
@@ -279,6 +336,12 @@ async def on_signal_received(signal):
                 )
         except httpx.HTTPError as error:
             print(f"Execution dispatch failed: {error}")
+            send_telegram_alert(
+                "TRADE_ERROR",
+                "Execution dispatch failed with HTTP error.",
+                level="ERROR",
+                extra={"symbol": symbol, "action": action, "error": str(error)},
+            )
             journal.log_signal(
                 source=signal.get("source", "orchestrator"),
                 symbol=symbol,

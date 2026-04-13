@@ -219,7 +219,15 @@ def analyze_and_trade() -> None:
                 excursion = max(0.0, bb_lower - current_price)
             else:
                 excursion = max(0.0, current_price - bb_upper)
-            confidence = max(0.0, min(1.0, excursion / max(current_price * 0.0005, 1e-6)))
+            confidence = max(0.0, min(100.0, (excursion / max(current_price * 0.0005, 1e-6)) * 100.0))
+
+            if confidence <= 70.0:
+                print(
+                    f"[MONITOR] Snap-back={signal_action} low confidence={confidence:.1f} | "
+                    f"Price={current_price:.2f} BB_L={bb_lower:.2f} BB_U={bb_upper:.2f} RSI2={rsi2:.1f}"
+                )
+                time.sleep(1.0)
+                continue
 
             signal = {
                 "source": "autonomous_scanner",
@@ -231,7 +239,7 @@ def analyze_and_trade() -> None:
                 "signal_bar_time": tick_time.isoformat(),
                 "signal_bar_relation": "tick",
                 "intended_price": float(current_price),
-                "confidence_score": round(confidence, 4),
+                "confidence_score": round(confidence, 1),
                 "indicators": {
                     "bb_upper": bb_upper,
                     "bb_lower": bb_lower,

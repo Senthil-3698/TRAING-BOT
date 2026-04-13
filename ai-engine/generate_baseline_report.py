@@ -113,6 +113,109 @@ def _r_bucket(r: float) -> str:
     return "> 2R"
 
 
+def _annualized_sharpe(returns: np.ndarray) -> float:
+    if returns.size < 2:
+        return 0.0
+    std = float(np.std(returns, ddof=1))
+    if std <= 0:
+        return 0.0
+    return float((np.mean(returns) / std) * np.sqrt(252.0))
+
+
+def _trade_return_series_from_df(trades: pd.DataFrame, initial_balance: float) -> np.ndarray:
+    if trades.empty or "pnl_usd" not in trades.columns:
+        return np.array([], dtype=float)
+
+    ordered = trades.copy()
+    if "close_time" in ordered.columns:
+        ordered = ordered.sort_values("close_time", na_position="last")
+
+    balance = float(initial_balance)
+    returns: list[float] = []
+    for pnl in ordered["pnl_usd"].fillna(0.0).astype(float).tolist():
+        denom = balance if abs(balance) > 1e-9 else 1.0
+        returns.append(float(pnl) / denom)
+        balance += float(pnl)
+    return np.array(returns, dtype=float)
+
+
+def _compute_walk_forward_from_trades(trades: pd.DataFrame, split_ratio: float = 0.7) -> dict:
+    initial_balance = 10_000.0
+    returns = _trade_return_series_from_df(trades, initial_balance=initial_balance)
+    n = int(returns.size)
+    if n < 2:
+        return {
+            "split_ratio_in_sample": split_ratio,
+            "in_sample_trades": n,
+            "out_of_sample_trades": 0,
+            "in_sample_sharpe": 0.0,
+            "out_of_sample_sharpe": 0.0,
+            "oos_drop_vs_insample_pct": 0.0,
+            "flag_oos_drop_gt_30pct": False,
+        }
+
+    split_idx = max(1, min(n - 1, int(round(n * split_ratio))))
+    in_sample = returns[:split_idx]
+    out_sample = returns[split_idx:]
+
+    in_sharpe = _annualized_sharpe(in_sample)
+    out_sharpe = _annualized_sharpe(out_sample)
+
+    if in_sharpe > 0:
+        drop_pct = max(0.0, (in_sharpe - out_sharpe) / in_sharpe)
+    elif in_sharpe < 0:
+        drop_pct = max(0.0, (abs(out_sharpe) - abs(in_sharpe)) / abs(in_sharpe))
+    else:
+        drop_pct = 0.0
+
+    return {
+        "split_ratio_in_sample": split_ratio,
+        "in_sample_trades": int(in_sample.size),
+        "out_of_sample_trades": int(out_sample.size),
+        "in_sample_sharpe": round(in_sharpe, 6),
+        "out_of_sample_sharpe": round(out_sharpe, 6),
+        "oos_drop_vs_insample_pct": round(drop_pct * 100.0, 4),
+        "flag_oos_drop_gt_30pct": bool(drop_pct > 0.30),
+    }
+
+
+def _compute_monte_carlo_from_trades(trades: pd.DataFrame, iterations: int = 1000, seed: int = 42) -> dict:
+    initial_balance = 10_000.0
+    returns = _trade_return_series_from_df(trades, initial_balance=initial_balance)
+    n = int(returns.size)
+    if n < 2:
+        return {
+            "iterations": iterations,
+            "sample_size": n,
+            "base_sharpe": 0.0,
+            "mean_sharpe": 0.0,
+            "std_sharpe": 0.0,
+            "p05_sharpe": 0.0,
+            "p50_sharpe": 0.0,
+            "p95_sharpe": 0.0,
+            "prob_sharpe_positive": 0.0,
+        }
+
+    base_sharpe = _annualized_sharpe(returns)
+    rng = np.random.default_rng(seed)
+    sharpes = np.empty(iterations, dtype=float)
+    for i in range(iterations):
+        sample = rng.choice(returns, size=n, replace=True)
+        sharpes[i] = _annualized_sharpe(sample)
+
+    return {
+        "iterations": iterations,
+        "sample_size": n,
+        "base_sharpe": round(base_sharpe, 6),
+        "mean_sharpe": round(float(np.mean(sharpes)), 6),
+        "std_sharpe": round(float(np.std(sharpes, ddof=1)), 6),
+        "p05_sharpe": round(float(np.percentile(sharpes, 5)), 6),
+        "p50_sharpe": round(float(np.percentile(sharpes, 50)), 6),
+        "p95_sharpe": round(float(np.percentile(sharpes, 95)), 6),
+        "prob_sharpe_positive": round(float(np.mean(sharpes > 0.0)), 6),
+    }
+
+
 def generate_report(run_dir: Path, output_md: Path):
     metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
     trades = pd.read_csv(run_dir / "trades.csv")
@@ -240,6 +343,49 @@ def generate_report(run_dir: Path, output_md: Path):
     report.append("## R-Level Outcomes by Exit Reason")
     report.append(_markdown_table(exit_reason))
     report.append("")
+
+    walk_forward = metrics.get("walk_forward", {}) if isinstance(metrics, dict) else {}
+    if not isinstance(walk_forward, dict) or not walk_forward:
+        walk_forward = _compute_walk_forward_from_trades(trades)
+    if isinstance(walk_forward, dict) and walk_forward:
+        wf_table = pd.DataFrame(
+            [
+                ["In-sample Split", f"{float(walk_forward.get('split_ratio_in_sample', 0.7)) * 100:.1f}%"],
+                ["Out-of-sample Split", f"{(1.0 - float(walk_forward.get('split_ratio_in_sample', 0.7))) * 100:.1f}%"],
+                ["In-sample Trades", int(walk_forward.get("in_sample_trades", 0))],
+                ["Out-of-sample Trades", int(walk_forward.get("out_of_sample_trades", 0))],
+                ["In-sample Sharpe", walk_forward.get("in_sample_sharpe", 0.0)],
+                ["Out-of-sample Sharpe", walk_forward.get("out_of_sample_sharpe", 0.0)],
+                ["OOS Drop vs IS %", walk_forward.get("oos_drop_vs_insample_pct", 0.0)],
+                ["Flag OOS Drop > 30%", bool(walk_forward.get("flag_oos_drop_gt_30pct", False))],
+            ],
+            columns=["Metric", "Value"],
+        )
+        report.append("## Walk-Forward Optimization (70/30)")
+        report.append(_markdown_table(wf_table))
+        report.append("")
+
+    monte_carlo = metrics.get("monte_carlo", {}) if isinstance(metrics, dict) else {}
+    if not isinstance(monte_carlo, dict) or not monte_carlo:
+        monte_carlo = _compute_monte_carlo_from_trades(trades)
+    if isinstance(monte_carlo, dict) and monte_carlo:
+        mc_table = pd.DataFrame(
+            [
+                ["Iterations", monte_carlo.get("iterations", 1000)],
+                ["Sample Size (Trades)", monte_carlo.get("sample_size", 0)],
+                ["Base Sharpe", monte_carlo.get("base_sharpe", 0.0)],
+                ["MC Mean Sharpe", monte_carlo.get("mean_sharpe", 0.0)],
+                ["MC Std Sharpe", monte_carlo.get("std_sharpe", 0.0)],
+                ["MC P05 Sharpe", monte_carlo.get("p05_sharpe", 0.0)],
+                ["MC P50 Sharpe", monte_carlo.get("p50_sharpe", 0.0)],
+                ["MC P95 Sharpe", monte_carlo.get("p95_sharpe", 0.0)],
+                ["P(Sharpe > 0)", monte_carlo.get("prob_sharpe_positive", 0.0)],
+            ],
+            columns=["Metric", "Value"],
+        )
+        report.append("## Monte Carlo Sharpe Stability (1000 Iterations)")
+        report.append(_markdown_table(mc_table))
+        report.append("")
 
     output_md.parent.mkdir(parents=True, exist_ok=True)
     output_md.write_text("\n".join(report), encoding="utf-8")

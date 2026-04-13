@@ -12,6 +12,7 @@ from mfe_analyzer import auto_tune_partial_r_if_due
 from mt5_executor import partial_close_position
 from state_manager import update_trade_stage
 from risk_engine import RiskEngine
+from alerts import send_telegram_alert
 
 r = redis.Redis(
     host=os.getenv("REDIS_HOST", "localhost"),
@@ -310,8 +311,29 @@ def log_trade_event(ticket, event_type):
 
     try:
         httpx.post("http://localhost:8080/events", json=payload, timeout=5.0)
+        event_key = str(event_type).upper()
+        if event_key == "ENTRY":
+            send_telegram_alert(
+                "TRADE_ENTRY",
+                "Trade entry event logged.",
+                level="INFO",
+                extra={"ticket": ticket, "event_type": event_key},
+            )
+        elif event_key in {"EXIT", "EOD", "TIME_EXPIRED", "SL", "TP", "TRAIL_SL", "FULL_EXIT", "PARTIAL_CLOSE"}:
+            send_telegram_alert(
+                "TRADE_EXIT",
+                "Trade exit event logged.",
+                level="INFO",
+                extra={"ticket": ticket, "event_type": event_key},
+            )
     except httpx.HTTPError as error:
         print(f"EVENT LOG FAILED for {ticket}: {error}")
+        send_telegram_alert(
+            "SYSTEM_ERROR",
+            "Failed to log trade event to execution engine.",
+            level="ERROR",
+            extra={"ticket": ticket, "event_type": event_type, "error": str(error)},
+        )
 
 def manage_exits():
     if not mt5.initialize():
@@ -334,9 +356,21 @@ def manage_exits():
                 if _close_position_market(ticket):
                     update_trade_stage(ticket, "TIME_EXPIRED")
                     log_trade_event(ticket, "TIME_EXPIRED")
+                    send_telegram_alert(
+                        "TRADE_EXIT",
+                        "Position closed by time-bomb safety rule.",
+                        level="INFO",
+                        extra={"ticket": ticket, "symbol": symbol, "reason": "TIME_EXPIRED"},
+                    )
                     print("[TIME EXPIRED] Closing stagnant position to free up margin.")
                 else:
                     print(f"[TIME EXPIRED] Failed to close stagnant position {ticket}.")
+                    send_telegram_alert(
+                        "TRADE_ERROR",
+                        "Failed to close position on time-bomb trigger.",
+                        level="ERROR",
+                        extra={"ticket": ticket, "symbol": symbol},
+                    )
                 continue
 
             symbol_info = mt5.symbol_info(symbol)
@@ -400,6 +434,12 @@ def modify_sl(ticket, new_sl, current_tp):
     )
     if not decision.allowed:
         print(f"[RISK BLOCK] {decision.code}: {decision.message}")
+        send_telegram_alert(
+            "TRADE_ERROR",
+            "Risk engine blocked SL/TP modification.",
+            level="ERROR",
+            extra={"ticket": ticket, "risk_code": decision.code},
+        )
         return
 
     request = {
@@ -411,6 +451,13 @@ def modify_sl(ticket, new_sl, current_tp):
     result = mt5.order_send(request)
     if result.retcode == mt5.TRADE_RETCODE_DONE:
         print(f"✅ Position {ticket}: SL moved to Breakeven.")
+    else:
+        send_telegram_alert(
+            "TRADE_ERROR",
+            "Failed to modify SL/TP for position.",
+            level="ERROR",
+            extra={"ticket": ticket, "retcode": getattr(result, "retcode", None)},
+        )
 
 if __name__ == "__main__":
     print("🛡️ Exit Manager Active: Guarding active trades...")

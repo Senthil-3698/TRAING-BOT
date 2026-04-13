@@ -724,6 +724,9 @@ def _calculate_metrics(
     dd_dollar = peak - equity
     dd_pct = np.where(peak > 0, dd_dollar / peak, 0.0)
 
+    walk_forward = _walk_forward_split_metrics(trades, split_ratio=0.7)
+    monte_carlo = _monte_carlo_sharpe_stability(trades, iterations=1000, seed=42)
+
     return {
         "total_trades": len(trades),
         "winners": len(winners),
@@ -742,6 +745,114 @@ def _calculate_metrics(
         "total_return_pct": round((final_balance - initial_balance) / initial_balance * 100, 2),
         "avg_win_usd": round(float(np.mean(winners)), 2) if winners else 0.0,
         "avg_loss_usd": round(float(np.mean(losers)), 2) if losers else 0.0,
+        "walk_forward": walk_forward,
+        "monte_carlo": monte_carlo,
+    }
+
+
+def _sorted_trades_for_analysis(trades: list[Trade]) -> list[Trade]:
+    def _trade_time_key(t: Trade):
+        return t.close_time or t.open_time or pd.Timestamp.min
+
+    return sorted(trades, key=_trade_time_key)
+
+
+def _trade_return_series(trades: list[Trade], initial_balance: float = 10_000.0) -> np.ndarray:
+    ordered = _sorted_trades_for_analysis(trades)
+    if not ordered:
+        return np.array([], dtype=float)
+
+    balance = float(initial_balance)
+    returns: list[float] = []
+    for trade in ordered:
+        denom = balance if abs(balance) > 1e-9 else 1.0
+        returns.append(float(trade.pnl_full) / denom)
+        balance += float(trade.pnl_full)
+    return np.array(returns, dtype=float)
+
+
+def _annualized_sharpe(returns: np.ndarray) -> float:
+    if returns.size < 2:
+        return 0.0
+    std = float(np.std(returns, ddof=1))
+    if std <= 0:
+        return 0.0
+    return float((np.mean(returns) / std) * np.sqrt(252.0))
+
+
+def _walk_forward_split_metrics(trades: list[Trade], split_ratio: float = 0.7) -> dict[str, float | int | bool]:
+    returns = _trade_return_series(trades)
+    n = int(returns.size)
+    if n < 2:
+        return {
+            "split_ratio_in_sample": split_ratio,
+            "in_sample_trades": n,
+            "out_of_sample_trades": 0,
+            "in_sample_sharpe": 0.0,
+            "out_of_sample_sharpe": 0.0,
+            "oos_drop_vs_insample_pct": 0.0,
+            "flag_oos_drop_gt_30pct": False,
+        }
+
+    split_idx = max(1, min(n - 1, int(round(n * split_ratio))))
+    in_sample = returns[:split_idx]
+    out_sample = returns[split_idx:]
+
+    in_sharpe = _annualized_sharpe(in_sample)
+    out_sharpe = _annualized_sharpe(out_sample)
+
+    if in_sharpe > 0:
+        drop_pct = max(0.0, (in_sharpe - out_sharpe) / in_sharpe)
+    elif in_sharpe < 0:
+        drop_pct = max(0.0, (abs(out_sharpe) - abs(in_sharpe)) / abs(in_sharpe))
+    else:
+        drop_pct = 0.0
+
+    return {
+        "split_ratio_in_sample": split_ratio,
+        "in_sample_trades": int(in_sample.size),
+        "out_of_sample_trades": int(out_sample.size),
+        "in_sample_sharpe": round(in_sharpe, 6),
+        "out_of_sample_sharpe": round(out_sharpe, 6),
+        "oos_drop_vs_insample_pct": round(drop_pct * 100.0, 4),
+        "flag_oos_drop_gt_30pct": bool(drop_pct > 0.30),
+    }
+
+
+def _monte_carlo_sharpe_stability(trades: list[Trade], iterations: int = 1000, seed: int = 42) -> dict[str, float | int]:
+    returns = _trade_return_series(trades)
+    n = int(returns.size)
+    if n < 2:
+        return {
+            "iterations": iterations,
+            "sample_size": n,
+            "base_sharpe": 0.0,
+            "mean_sharpe": 0.0,
+            "std_sharpe": 0.0,
+            "p05_sharpe": 0.0,
+            "p50_sharpe": 0.0,
+            "p95_sharpe": 0.0,
+            "prob_sharpe_positive": 0.0,
+        }
+
+    rng = np.random.default_rng(seed)
+    base_sharpe = _annualized_sharpe(returns)
+    sampled_sharpes = np.empty(iterations, dtype=float)
+
+    for i in range(iterations):
+        sample = rng.choice(returns, size=n, replace=True)
+        sampled_sharpes[i] = _annualized_sharpe(sample)
+
+    return {
+        "iterations": iterations,
+        "sample_size": n,
+        "base_sharpe": round(base_sharpe, 6),
+        "mean_sharpe": round(float(np.mean(sampled_sharpes)), 6),
+        "std_sharpe": round(float(np.std(sampled_sharpes, ddof=1)), 6),
+        "p05_sharpe": round(float(np.percentile(sampled_sharpes, 5)), 6),
+        "p50_sharpe": round(float(np.percentile(sampled_sharpes, 50)), 6),
+        "p95_sharpe": round(float(np.percentile(sampled_sharpes, 95)), 6),
+        "prob_sharpe_positive": round(float(np.mean(sampled_sharpes > 0.0)), 6),
     }
 
 

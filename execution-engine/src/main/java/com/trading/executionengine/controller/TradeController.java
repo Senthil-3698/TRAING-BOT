@@ -28,7 +28,10 @@ import java.util.UUID;
 @RestController
 public class TradeController {
 
-    private static final double DEFAULT_STOP_LOSS_PIPS = 50.0;
+    private static final double MIN_CONFIDENCE_SCORE = 70.0;
+    private static final int MAX_BRIDGE_RETRIES = 3;
+    private static final long RETRY_BASE_BACKOFF_MS = 200L;
+    private static final long LATENCY_ALERT_MS = 500L;
 
     private final TradeRepository tradeRepository;
     private final TradeEventRepository tradeEventRepository;
@@ -54,6 +57,11 @@ public class TradeController {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Risk Manager rejected trade.");
         }
 
+        if (request.confidenceScore() <= MIN_CONFIDENCE_SCORE) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                    .body("Signal rejected: confidence score must be greater than 70.");
+        }
+
         Trade trade = new Trade();
         trade.setId(UUID.randomUUID());
         trade.setSymbol(request.symbol().toUpperCase());
@@ -68,15 +76,21 @@ public class TradeController {
         tradeRepository.save(trade);
 
         // Authoritative risk and sizing now run in Python RiskEngine (broker bridge).
+        String optionalFields = "";
+        if (request.intendedPrice() != null) {
+            optionalFields += String.format(",\"intended_price\":%.10f", request.intendedPrice());
+        }
+        if (request.slippageTolerancePips() != null) {
+            optionalFields += String.format(",\"slippage_tolerance_pips\":%.4f", request.slippageTolerancePips());
+        }
         String bridgePayload = String.format(
-            "{\"symbol\":\"%s\",\"action\":\"%s\",\"timeframe\":\"%s\",\"volume\":%.2f,\"stop_loss_pips\":%.2f,\"take_profit_pips\":%.2f,\"confidence_score\":%.4f}",
+            "{\"symbol\":\"%s\",\"action\":\"%s\",\"timeframe\":\"%s\",\"volume\":%.2f,\"confidence_score\":%.4f%s}",
             request.symbol().toUpperCase(),
             request.action().toUpperCase(),
             request.timeframe().toLowerCase(),
             0.01,
-            DEFAULT_STOP_LOSS_PIPS,
-            DEFAULT_STOP_LOSS_PIPS * 2,
-            request.confidenceScore()
+            request.confidenceScore(),
+            optionalFields
         );
 
         try {
@@ -91,11 +105,83 @@ public class TradeController {
                 .POST(HttpRequest.BodyPublishers.ofString(bridgePayload))
                 .build();
 
-            HttpResponse<String> bridgeResponse = client.send(bridgeRequest, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> bridgeResponse = null;
+            int attempts = 0;
+            IOException lastIoError = null;
+            InterruptedException lastInterrupted = null;
+
+            for (int attempt = 1; attempt <= MAX_BRIDGE_RETRIES; attempt++) {
+                attempts = attempt;
+                Instant sendStart = Instant.now();
+                try {
+                    bridgeResponse = client.send(bridgeRequest, HttpResponse.BodyHandlers.ofString());
+                } catch (IOException ioError) {
+                    lastIoError = ioError;
+                } catch (InterruptedException interruptedError) {
+                    lastInterrupted = interruptedError;
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+
+                long latencyMs = Duration.between(sendStart, Instant.now()).toMillis();
+                System.out.printf(
+                    "[EXECUTION_LATENCY] symbol=%s action=%s attempt=%d latency_ms=%d%n",
+                    request.symbol(),
+                    request.action(),
+                    attempt,
+                    latencyMs
+                );
+                if (latencyMs > LATENCY_ALERT_MS) {
+                    System.out.printf(
+                        "[EXECUTION_LATENCY_ALERT] symbol=%s action=%s attempt=%d latency_ms=%d threshold_ms=%d%n",
+                        request.symbol(),
+                        request.action(),
+                        attempt,
+                        latencyMs,
+                        LATENCY_ALERT_MS
+                    );
+                }
+
+                if (bridgeResponse != null && bridgeResponse.statusCode() == 200) {
+                    break;
+                }
+
+                boolean retriableStatus = bridgeResponse != null
+                        && (bridgeResponse.statusCode() >= 500 || bridgeResponse.statusCode() == 429);
+                if (attempt < MAX_BRIDGE_RETRIES && retriableStatus) {
+                    long backoffMs = RETRY_BASE_BACKOFF_MS * (1L << (attempt - 1));
+                    System.out.printf(
+                        "[BRIDGE_RETRY] symbol=%s action=%s attempt=%d status=%d backoff_ms=%d%n",
+                        request.symbol(),
+                        request.action(),
+                        attempt,
+                        bridgeResponse.statusCode(),
+                        backoffMs
+                    );
+                    try {
+                        Thread.sleep(backoffMs);
+                    } catch (InterruptedException interruptedSleep) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if (bridgeResponse == null) {
+                if (lastInterrupted != null) {
+                    return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                            .body("Trade queued but MT5 bridge call interrupted.");
+                }
+                String message = lastIoError != null ? lastIoError.getMessage() : "No response from bridge.";
+                return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                        .body("Trade queued but MT5 bridge call failed after retries: " + message);
+            }
 
             if (bridgeResponse.statusCode() != 200) {
-            return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                .body("Trade queued but MT5 bridge rejected execution: " + bridgeResponse.body());
+                return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                    .body("Trade queued but MT5 bridge rejected execution after " + attempts + " attempts: " + bridgeResponse.body());
             }
 
             try {

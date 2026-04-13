@@ -21,8 +21,8 @@ risk_engine = RiskEngine()
 quality_monitor = ExecutionQualityMonitor()
 
 MAX_SLIPPAGE_POINTS = 5  # 0.5 pips on XAUUSD point convention
-HIT_RUN_SL_POINTS = 100  # 10 pips
-HIT_RUN_TP_POINTS = 100  # 10 pips
+DEFAULT_FALLBACK_SL_PIPS = 50.0
+DEFAULT_TP_RR = 2.0
 
 
 def _initialize_mt5():
@@ -64,6 +64,21 @@ def calculate_atr(symbol, timeframe, period=ATR_PERIOD):
     atr = np.mean(tr[-period:])  # Average of last `period` TR values
     
     return atr
+
+
+def _atr_stop_loss_pips(symbol, period=ATR_PERIOD, sl_multiplier=SL_MULTIPLIER):
+    symbol_info = mt5.symbol_info(symbol)
+    if not symbol_info or not symbol_info.point:
+        return DEFAULT_FALLBACK_SL_PIPS
+
+    atr = calculate_atr(symbol, mt5.TIMEFRAME_M5, period=period)
+    if atr is None:
+        return DEFAULT_FALLBACK_SL_PIPS
+
+    point_value = 1 if symbol == "XAUUSD" else 10
+    atr_pips = (atr / symbol_info.point) / point_value
+    sl_pips = atr_pips * sl_multiplier
+    return max(1.0, sl_pips)
 
 
 def calculate_dynamic_lot_size(symbol, risk_percent=RISK_PER_TRADE, sl_multiplier=SL_MULTIPLIER):
@@ -131,12 +146,12 @@ def execute_market_order(symbol, action, lot_size=None, sl_pips=None, tp_pips=No
     if lot_size is None:
         lot_size = calculate_dynamic_lot_size(symbol)
     
-    # Hit-and-run strict risk profile: fixed 10 pips SL / 10 pips TP.
+    # Use volatility-aware SL by default so risk breathes with the market.
     if sl_pips is None:
-        sl_pips = HIT_RUN_SL_POINTS
+        sl_pips = _atr_stop_loss_pips(symbol)
     
     if tp_pips is None:
-        tp_pips = HIT_RUN_TP_POINTS
+        tp_pips = sl_pips * DEFAULT_TP_RR
 
     decision = risk_engine.pre_trade_check(
         symbol=symbol,
@@ -223,9 +238,9 @@ def execute_trade(action, symbol, timeframe, lot_size=None, sl_pips=None, tp_pip
     Uses dynamic positioning by default (calculates lot based on ATR and account equity).
     """
     if sl_pips is None:
-        sl_pips = HIT_RUN_SL_POINTS
+        sl_pips = _atr_stop_loss_pips(symbol)
     if tp_pips is None:
-        tp_pips = HIT_RUN_TP_POINTS
+        tp_pips = sl_pips * DEFAULT_TP_RR
 
     return execute_market_order(symbol, action, lot_size, sl_pips, tp_pips)
 
