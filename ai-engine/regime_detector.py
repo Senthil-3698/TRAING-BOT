@@ -16,6 +16,16 @@ load_dotenv()
 REGIME_KEY_PREFIX = os.getenv("REGIME_CACHE_KEY_PREFIX", "market:regime")
 REGIME_REFRESH_SECONDS = int(os.getenv("REGIME_REFRESH_SECONDS", "300"))
 REGIME_LOOKBACK_BARS = int(os.getenv("REGIME_LOOKBACK_BARS", "240"))
+REGIME_HYSTERESIS_CONFIRMATIONS = int(os.getenv("REGIME_HYSTERESIS_CONFIRMATIONS", "2"))
+REGIME_STATE_TTL_SECONDS = int(os.getenv("REGIME_STATE_TTL_SECONDS", str(86400)))
+
+ADX_RANGING_MAX = float(os.getenv("ADX_RANGING_MAX", "20"))
+ADX_TRENDING_MIN = float(os.getenv("ADX_TRENDING_MIN", "25"))
+ADX_TRANSITIONAL_MIN = float(os.getenv("ADX_TRANSITIONAL_MIN", "20"))
+ADX_TRANSITIONAL_MAX = float(os.getenv("ADX_TRANSITIONAL_MAX", "25"))
+
+# Slope normalized by ATR (%-move over window divided by ATR%-of-price).
+SLOPE_TO_ATR_TREND_THRESHOLD = float(os.getenv("SLOPE_TO_ATR_TREND_THRESHOLD", "0.35"))
 
 
 def _redis_client() -> redis.Redis:
@@ -127,6 +137,17 @@ def _compute_atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period, min_periods=period).mean()
 
 
+def _atr_pct_of_price(df: pd.DataFrame, period: int = 14) -> float:
+    atr = _compute_atr_series(df, period=period).dropna()
+    if atr.empty:
+        return 0.0
+    latest_atr = float(atr.iloc[-1])
+    latest_close = float(df["close"].iloc[-1]) if not df.empty else 0.0
+    if latest_close == 0.0:
+        return 0.0
+    return latest_atr / latest_close
+
+
 def _atr_percentile(df: pd.DataFrame, period: int = 14, lookback: int = 120) -> float:
     atr = _compute_atr_series(df, period)
     tail = atr.dropna().tail(lookback)
@@ -203,27 +224,33 @@ def _classify(features: dict[str, float]) -> tuple[str, str]:
     swing_points = features["swing_points"]
     autocorr = features["close_autocorr"]
     slope_pct = features["close_slope_pct"]
+    atr_pct_of_price = max(float(features.get("atr_pct_of_price", 0.0)), 1e-9)
+    slope_to_atr = abs(slope_pct) / atr_pct_of_price
 
     if atr_pct >= 0.85 and bb_pct >= 0.80 and adx >= 20:
         if slope_pct >= 0:
             return "HIGH_VOL_BREAKOUT", "High volatility expansion with upward pressure"
         return "HIGH_VOL_BREAKOUT", "High volatility expansion with downward pressure"
 
-    if adx >= 25 and autocorr >= 0.12 and slope_pct > 0.0008:
+    if adx >= ADX_TRENDING_MIN and autocorr >= 0.12 and slope_pct > 0 and slope_to_atr >= SLOPE_TO_ATR_TREND_THRESHOLD:
         return "TRENDING_UP", "Strong directional persistence and positive slope"
 
-    if adx >= 25 and autocorr <= -0.05 and slope_pct < -0.0008:
+    if adx >= ADX_TRENDING_MIN and autocorr <= -0.05 and slope_pct < 0 and slope_to_atr >= SLOPE_TO_ATR_TREND_THRESHOLD:
         return "TRENDING_DOWN", "Strong directional persistence and negative slope"
 
     if atr_pct <= 0.25 and bb_pct <= 0.30 and adx <= 18:
         return "LOW_VOL_DRIFT", "Compressed volatility and weak directional drive"
 
-    if adx <= 20 and bb_pct <= 0.55 and swing_points >= 12:
+    if adx <= ADX_RANGING_MAX and bb_pct <= 0.55 and swing_points >= 12:
         return "RANGING", "Frequent swings with weak trend quality"
 
-    if adx >= 22 and slope_pct >= 0:
+    # Explicit ADX gray zone handling: 20-25 is transitional unless features strongly confirm trend.
+    if ADX_TRANSITIONAL_MIN <= adx < ADX_TRANSITIONAL_MAX:
+        return "TRANSITIONAL", "ADX gray zone (20-25): transition regime, avoid hard vetoes"
+
+    if adx >= 22 and slope_pct >= 0 and slope_to_atr >= SLOPE_TO_ATR_TREND_THRESHOLD:
         return "TRENDING_UP", "Fallback trend-up classification"
-    if adx >= 22 and slope_pct < 0:
+    if adx >= 22 and slope_pct < 0 and slope_to_atr >= SLOPE_TO_ATR_TREND_THRESHOLD:
         return "TRENDING_DOWN", "Fallback trend-down classification"
 
     return "RANGING", "Default classification: mixed structure"
@@ -256,6 +283,7 @@ def compute_regime(symbol: str, timeframe: str = "M5", bars: int = REGIME_LOOKBA
     features: dict[str, float] = {
         "adx": round(_compute_adx(df), 4),
         "atr_percentile": round(_atr_percentile(df), 4),
+        "atr_pct_of_price": round(_atr_pct_of_price(df), 6),
         "swing_points": float(_swing_points(df, lookback=80)),
         "close_autocorr": round(_close_autocorr(df, lookback=80), 4),
         "close_slope_pct": round(_close_slope_pct(df, window=30), 6),
@@ -277,6 +305,74 @@ def compute_regime(symbol: str, timeframe: str = "M5", bars: int = REGIME_LOOKBA
     }
 
 
+def _apply_hysteresis(
+    cache: redis.Redis,
+    key: str,
+    computed_payload: dict[str, Any],
+    confirmations: int = REGIME_HYSTERESIS_CONFIRMATIONS,
+) -> dict[str, Any]:
+    """Require N consecutive candidate readings before switching away from active regime."""
+    state_key = f"{key}:state"
+
+    default_state = {
+        "active_regime": computed_payload.get("regime", "UNKNOWN"),
+        "candidate_regime": computed_payload.get("regime", "UNKNOWN"),
+        "candidate_count": 1,
+        "last_update": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        raw_state = cache.get(state_key)
+        state = json.loads(raw_state.decode("utf-8")) if raw_state else default_state
+    except Exception:
+        state = default_state
+
+    active = state.get("active_regime", default_state["active_regime"])
+    candidate = computed_payload.get("regime", "UNKNOWN")
+
+    if candidate == active:
+        state["candidate_regime"] = candidate
+        state["candidate_count"] = 0
+        final_regime = active
+        final_reason = computed_payload.get("reason", "")
+    else:
+        if state.get("candidate_regime") == candidate:
+            state["candidate_count"] = int(state.get("candidate_count", 0)) + 1
+        else:
+            state["candidate_regime"] = candidate
+            state["candidate_count"] = 1
+
+        if int(state.get("candidate_count", 0)) >= max(1, confirmations):
+            state["active_regime"] = candidate
+            state["candidate_count"] = 0
+            final_regime = candidate
+            final_reason = f"{computed_payload.get('reason', '')}; hysteresis switch confirmed"
+        else:
+            final_regime = active
+            final_reason = (
+                f"Hysteresis hold: pending switch {active} -> {candidate} "
+                f"({state.get('candidate_count')}/{max(1, confirmations)})"
+            )
+
+    state["last_update"] = datetime.now(timezone.utc).isoformat()
+    try:
+        cache.setex(state_key, REGIME_STATE_TTL_SECONDS, json.dumps(state, default=str))
+    except Exception:
+        pass
+
+    out = dict(computed_payload)
+    out["raw_regime"] = computed_payload.get("regime")
+    out["regime"] = final_regime
+    out["reason"] = final_reason
+    out["hysteresis"] = {
+        "active_regime": state.get("active_regime"),
+        "candidate_regime": state.get("candidate_regime"),
+        "candidate_count": int(state.get("candidate_count", 0)),
+        "required_confirmations": max(1, confirmations),
+    }
+    return out
+
+
 def get_current_regime(symbol: str, timeframe: str = "M5") -> dict[str, Any]:
     key = f"{REGIME_KEY_PREFIX}:{symbol.upper()}:{timeframe.upper()}"
     cache = _redis_client()
@@ -291,5 +387,6 @@ def get_current_regime(symbol: str, timeframe: str = "M5") -> dict[str, Any]:
             pass
 
     regime_payload = compute_regime(symbol=symbol, timeframe=timeframe)
+    regime_payload = _apply_hysteresis(cache, key, regime_payload)
     cache.setex(key, REGIME_REFRESH_SECONDS, json.dumps(regime_payload, default=str))
     return regime_payload
