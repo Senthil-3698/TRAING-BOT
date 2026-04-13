@@ -25,6 +25,23 @@ class BaselineProfile:
     backtest_slippage_points: float
     backtest_loss_p95_usd: float
     baseline_run_dir: str
+    baseline_source: str
+
+
+def _baseline_account_balance_usd() -> float:
+    return float(os.getenv("PERF_BASELINE_ACCOUNT_BALANCE_USD", "10000"))
+
+
+def _live_account_balance_usd() -> float:
+    return float(os.getenv("PERF_LIVE_ACCOUNT_BALANCE_USD", str(_baseline_account_balance_usd())))
+
+
+def _is_backtest_run_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "metrics.json").exists() and (path / "trades.csv").exists()
+
+
+def _is_walkforward_run_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "summary.json").exists() and (path / "window_results.csv").exists()
 
 
 def _db_config() -> dict[str, Any]:
@@ -45,48 +62,101 @@ def _redis_client() -> redis.Redis:
     )
 
 
-def _find_latest_baseline_run(backtest_root: Path) -> Path:
+def _find_latest_baseline_run(backtest_root: Path) -> tuple[Path, str]:
     explicit = os.getenv("BACKTEST_BASELINE_RUN_DIR")
     if explicit:
         p = Path(explicit)
-        if p.is_dir() and (p / "metrics.json").exists() and (p / "trades.csv").exists():
-            return p
+        if _is_backtest_run_dir(p):
+            return p, "backtest"
+        if _is_walkforward_run_dir(p):
+            return p, "walkforward"
 
     candidates = [
         p for p in backtest_root.iterdir()
-        if p.is_dir() and (p / "metrics.json").exists() and (p / "trades.csv").exists()
+        if p.is_dir() and (_is_backtest_run_dir(p) or _is_walkforward_run_dir(p))
     ]
     if not candidates:
-        raise RuntimeError("No baseline run found under backtest_results with metrics.json and trades.csv.")
+        raise RuntimeError(
+            "No baseline run found. Expected either backtest artifacts (metrics.json + trades.csv) "
+            "or walk-forward artifacts (summary.json + window_results.csv)."
+        )
 
     candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-    return candidates[0]
+    latest = candidates[0]
+    if _is_backtest_run_dir(latest):
+        return latest, "backtest"
+    return latest, "walkforward"
 
 
 def _load_baseline(backtest_root: Path) -> BaselineProfile:
-    run_dir = _find_latest_baseline_run(backtest_root)
-    metrics_path = run_dir / "metrics.json"
-    trades_path = run_dir / "trades.csv"
+    run_dir, source = _find_latest_baseline_run(backtest_root)
 
-    with open(metrics_path, "r", encoding="utf-8") as handle:
-        metrics = json.load(handle)
+    if source == "backtest":
+        metrics_path = run_dir / "metrics.json"
+        trades_path = run_dir / "trades.csv"
 
-    baseline_win_rate = float(metrics.get("win_rate_pct", 0.0))
-    baseline_max_dd = float(metrics.get("max_drawdown_pct", 0.0))
+        with open(metrics_path, "r", encoding="utf-8") as handle:
+            metrics = json.load(handle)
 
-    loss_sizes = []
-    with open(trades_path, "r", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            pnl_text = row.get("pnl_usd")
-            if pnl_text is None:
-                continue
-            try:
-                pnl = float(pnl_text)
-            except ValueError:
-                continue
-            if pnl < 0:
-                loss_sizes.append(abs(pnl))
+        baseline_win_rate = float(metrics.get("win_rate_pct", 0.0))
+        baseline_max_dd = float(metrics.get("max_drawdown_pct", 0.0))
+
+        loss_sizes = []
+        with open(trades_path, "r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                pnl_text = row.get("pnl_usd")
+                if pnl_text is None:
+                    continue
+                try:
+                    pnl = float(pnl_text)
+                except ValueError:
+                    continue
+                if pnl < 0:
+                    loss_sizes.append(abs(pnl))
+    else:
+        # Walk-forward baseline compatibility: derive equivalent watchdog stats from window outputs.
+        summary_path = run_dir / "summary.json"
+        windows_path = run_dir / "window_results.csv"
+
+        with open(summary_path, "r", encoding="utf-8") as handle:
+            _ = json.load(handle)
+
+        test_returns_pct: list[float] = []
+        with open(windows_path, "r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                r_txt = row.get("test_return_pct")
+                if r_txt is None:
+                    continue
+                try:
+                    test_returns_pct.append(float(r_txt))
+                except ValueError:
+                    continue
+
+        if test_returns_pct:
+            wins = sum(1 for r in test_returns_pct if r > 0)
+            baseline_win_rate = (wins / len(test_returns_pct)) * 100.0
+
+            equity = 100.0
+            peak = 100.0
+            max_dd = 0.0
+            for ret_pct in test_returns_pct:
+                equity *= (1.0 + (ret_pct / 100.0))
+                if equity > peak:
+                    peak = equity
+                if peak > 0:
+                    dd = ((peak - equity) / peak) * 100.0
+                    max_dd = max(max_dd, dd)
+            baseline_max_dd = max_dd
+
+            neg_returns = [abs(r) for r in test_returns_pct if r < 0]
+            account = _baseline_account_balance_usd()
+            loss_sizes = [(pct / 100.0) * account for pct in neg_returns]
+        else:
+            baseline_win_rate = 0.0
+            baseline_max_dd = 0.0
+            loss_sizes = []
 
     loss_p95 = float(np.percentile(loss_sizes, 95)) if loss_sizes else float(os.getenv("PERF_FALLBACK_LOSS_P95_USD", "100.0"))
     baseline_slippage = float(os.getenv("PERF_BASELINE_SLIPPAGE_POINTS", "5.0"))
@@ -97,6 +167,7 @@ def _load_baseline(backtest_root: Path) -> BaselineProfile:
         backtest_slippage_points=baseline_slippage,
         backtest_loss_p95_usd=loss_p95,
         baseline_run_dir=str(run_dir),
+        baseline_source=source,
     )
 
 
@@ -188,10 +259,14 @@ def _drawdown_breach(live_pnls_desc: list[float], baseline_max_dd_pct: float) ->
         return False, {"reason": "no_live_closed_trades"}
 
     ordered = list(reversed(live_pnls_desc))
+    account_balance = _live_account_balance_usd()
+    if account_balance <= 0:
+        return False, {"reason": "invalid_live_account_balance", "balance": account_balance}
+
     equity = 100.0
     curve = []
     for pnl in ordered:
-        equity += pnl
+        equity += (pnl / account_balance) * 100.0
         curve.append(equity)
 
     peak = -1e18
@@ -210,7 +285,21 @@ def _drawdown_breach(live_pnls_desc: list[float], baseline_max_dd_pct: float) ->
         "live_max_drawdown_pct": round(max_dd_pct, 4),
         "baseline_max_drawdown_pct": round(baseline_max_dd_pct, 4),
         "threshold_pct": round(threshold, 4),
+        "live_account_balance_usd": round(account_balance, 2),
     }
+
+
+def _effective_poll_interval_seconds(base_interval_seconds: int) -> int:
+    """Use faster polling during active UTC trading hours to react quicker in fast drawdowns."""
+    fast_interval = int(os.getenv("WATCHDOG_FAST_INTERVAL_SECONDS", "15"))
+    active_start = int(os.getenv("WATCHDOG_ACTIVE_START_HOUR_UTC", "6"))
+    active_end = int(os.getenv("WATCHDOG_ACTIVE_END_HOUR_UTC", "21"))
+
+    now_hour = datetime.now(timezone.utc).hour
+    in_active_window = active_start <= now_hour < active_end
+    if in_active_window:
+        return max(1, min(base_interval_seconds, fast_interval))
+    return max(1, base_interval_seconds)
 
 
 def _consecutive_extreme_losses_breach(live_pnls_desc: list[float], loss_p95: float) -> tuple[bool, dict[str, Any]]:
@@ -279,6 +368,7 @@ def evaluate_once(backtest_root: Path) -> dict[str, Any]:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "baseline": {
             "run_dir": baseline.baseline_run_dir,
+            "source": baseline.baseline_source,
             "win_rate_pct_90d": baseline.backtest_win_rate_pct_90d,
             "max_drawdown_pct": baseline.backtest_max_drawdown_pct,
             "baseline_slippage_points": baseline.backtest_slippage_points,
@@ -300,14 +390,15 @@ def evaluate_once(backtest_root: Path) -> dict[str, Any]:
 
 def run_loop(backtest_root: Path, interval_seconds: int) -> None:
     print("[WATCHDOG] Started.")
-    print(f"[WATCHDOG] interval_seconds={interval_seconds}")
+    print(f"[WATCHDOG] base_interval_seconds={interval_seconds}")
     while True:
         try:
             report = evaluate_once(backtest_root)
             print(json.dumps(report, default=str))
         except Exception as error:
             print(f"[WATCHDOG] Evaluation error: {error}")
-        time.sleep(interval_seconds)
+        sleep_seconds = _effective_poll_interval_seconds(interval_seconds)
+        time.sleep(sleep_seconds)
 
 
 def main() -> None:
