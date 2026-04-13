@@ -1,8 +1,14 @@
 import MetaTrader5 as mt5
 import os
+import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
+sys.path.append(str(Path(__file__).resolve().parent / "ai-engine"))
+from risk_engine import RiskEngine
+
 load_dotenv()
+risk_engine = RiskEngine()
 
 def emergency_shutdown():
     print("🚨 EMERGENCY SHUTDOWN INITIATED...")
@@ -37,6 +43,16 @@ def emergency_shutdown():
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
+            decision = risk_engine.pre_trade_check(
+                symbol=pos.symbol,
+                action="CLOSE",
+                timeframe="1m",
+                source="kill_switch",
+                purpose="CLOSE",
+            )
+            if not decision.allowed:
+                print(f"Risk blocked close for {pos.ticket}: {decision.code} {decision.message}")
+                continue
             result = mt5.order_send(request)
             print(f"Closed Ticket {pos.ticket}: {result.comment}")
     else:

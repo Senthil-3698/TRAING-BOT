@@ -83,6 +83,11 @@ class Signal:
     timestamp: pd.Timestamp
     signal_price: float    # close price at signal bar
     atr_m5: float          # ATR at signal time (used for lot sizing)
+    h1_bias: str
+    h4_bias: str
+    integrated_bias: str
+    session_label: str
+    day_of_week: str
 
 
 @dataclass
@@ -97,6 +102,13 @@ class Trade:
     lot_size: float
     remaining_lots: float
     initial_risk_points: float   # SL distance in points
+    signal_time: pd.Timestamp
+    h1_bias: str
+    h4_bias: str
+    integrated_bias: str
+    bias_alignment: str
+    session_label: str
+    day_of_week: str
 
     # Mutable state machine
     stage: str = "ENTRY"   # ENTRY → BREAKEVEN → PARTIAL_CLOSED → TRAILING → CLOSED
@@ -109,7 +121,10 @@ class Trade:
     close_time: Optional[pd.Timestamp] = None
     close_price: Optional[float] = None
     close_reason: str = ""
+    close_stage: str = ""
     r_multiple: float = 0.0
+    mfe_r: float = 0.0
+    mae_r: float = 0.0
 
 
 @dataclass
@@ -190,7 +205,16 @@ def generate_signal(
     # ── Session Gate ──────────────────────────────────────────────
     bar_ts = df_m1["time"].iloc[-1]
     hour_utc = pd.Timestamp(bar_ts).hour
+    day_of_week = pd.Timestamp(bar_ts).day_name()
     in_session = SESSION_OPEN_UTC <= hour_utc < SESSION_CLOSE_UTC
+    if 13 <= hour_utc < 17:
+        session_label = "OVERLAP"
+    elif 8 <= hour_utc < 13:
+        session_label = "LONDON"
+    elif 17 <= hour_utc < 21:
+        session_label = "NEW_YORK"
+    else:
+        session_label = "OFF_SESSION"
 
     # ── Position Cap ──────────────────────────────────────────────
     if state.open_position_count >= MAX_POSITIONS:
@@ -204,11 +228,13 @@ def generate_signal(
 
     if (trend_bullish and bullish_cross and volume_strong
             and integrated_bias in ("BULLISH", "NO_CONFLUENCE")):
-        return Signal("BUY", timestamp, current_price, atr_m5)
+        return Signal("BUY", timestamp, current_price, atr_m5, h1_bias, h4_bias,
+                  integrated_bias, session_label, day_of_week)
 
     if (trend_bearish and bearish_cross and volume_strong
             and integrated_bias in ("BEARISH", "NO_CONFLUENCE")):
-        return Signal("SELL", timestamp, current_price, atr_m5)
+        return Signal("SELL", timestamp, current_price, atr_m5, h1_bias, h4_bias,
+                  integrated_bias, session_label, day_of_week)
 
     return None
 
@@ -298,6 +324,15 @@ def simulate_fill(
 
     lot = calculate_lot_size(balance, atr_points)
 
+    if signal.integrated_bias == "NO_CONFLUENCE":
+        bias_alignment = "NO_CONFLUENCE"
+    elif signal.action == "BUY" and signal.integrated_bias == "BULLISH":
+        bias_alignment = "ALIGNED"
+    elif signal.action == "SELL" and signal.integrated_bias == "BEARISH":
+        bias_alignment = "ALIGNED"
+    else:
+        bias_alignment = "COUNTER_TREND"
+
     return Trade(
         trade_id=0,
         action=signal.action,
@@ -309,6 +344,13 @@ def simulate_fill(
         lot_size=lot,
         remaining_lots=lot,
         initial_risk_points=atr_points,
+        signal_time=signal.timestamp,
+        h1_bias=signal.h1_bias,
+        h4_bias=signal.h4_bias,
+        integrated_bias=signal.integrated_bias,
+        bias_alignment=bias_alignment,
+        session_label=signal.session_label,
+        day_of_week=signal.day_of_week,
     )
 
 
@@ -342,6 +384,8 @@ def process_bar_for_trade(
     hi = bar["high"]
     lo = bar["low"]
     spread_price = spread_points * POINT
+
+    _update_excursion(trade, hi, lo)
 
     # Pre-compute all trigger levels
     be_target = e + r if is_buy else e - r
@@ -427,8 +471,25 @@ def _pnl(action: str, entry: float, close: float, lots: float, commission: float
     return gross - commission
 
 
+def _update_excursion(trade: Trade, hi: float, lo: float):
+    """Track max favorable/adverse excursion in R units for each open trade."""
+    r = trade.initial_risk_points * POINT
+    if r <= 0:
+        return
+    if trade.action == "BUY":
+        favorable = max(0.0, hi - trade.entry_price)
+        adverse = max(0.0, trade.entry_price - lo)
+    else:
+        favorable = max(0.0, trade.entry_price - lo)
+        adverse = max(0.0, hi - trade.entry_price)
+
+    trade.mfe_r = max(trade.mfe_r, favorable / r)
+    trade.mae_r = max(trade.mae_r, adverse / r)
+
+
 def _close_trade(trade: Trade, close_time, close_price: float, reason: str, total_pnl: float):
     """Finalize a Trade object (mutates in-place)."""
+    trade.close_stage = trade.stage
     trade.close_time = close_time
     trade.close_price = close_price
     trade.close_reason = reason
@@ -448,6 +509,8 @@ def fetch_historical_data(symbol: str, from_date: datetime, to_date: datetime) -
         raise RuntimeError("MetaTrader5 package not installed.")
     if not mt5.initialize():
         raise RuntimeError(f"MT5 initialize() failed: {mt5.last_error()}")
+    if not mt5.symbol_select(symbol, True):
+        raise RuntimeError(f"MT5 symbol_select({symbol}) failed: {mt5.last_error()}")
 
     tf_map = {
         "M1": mt5.TIMEFRAME_M1,
@@ -455,17 +518,46 @@ def fetch_historical_data(symbol: str, from_date: datetime, to_date: datetime) -
         "H1": mt5.TIMEFRAME_H1,
         "H4": mt5.TIMEFRAME_H4,
     }
+    tf_minutes = {
+        "M1": 1,
+        "M5": 5,
+        "H1": 60,
+        "H4": 240,
+    }
+    from_dt = from_date.astimezone(timezone.utc).replace(tzinfo=None)
+    to_dt = to_date.astimezone(timezone.utc).replace(tzinfo=None)
     data: dict[str, pd.DataFrame] = {}
     try:
         for name, tf in tf_map.items():
-            rates = mt5.copy_rates_range(symbol, tf, from_date, to_date)
-            if rates is None or len(rates) == 0:
+            span_minutes = max(int((to_date - from_date).total_seconds() / 60), tf_minutes[name])
+            bars_needed = int(span_minutes / tf_minutes[name]) + 500
+            chunks = []
+            start_pos = 0
+            remaining = bars_needed
+            chunk_size = 50_000
+            while remaining > 0:
+                take = min(chunk_size, remaining)
+                rates = mt5.copy_rates_from_pos(symbol, tf, start_pos, take)
+                if rates is None or len(rates) == 0:
+                    break
+                chunks.append(pd.DataFrame(rates))
+                start_pos += take
+                remaining -= take
+
+            if not chunks:
                 raise RuntimeError(
                     f"No {name} data for {symbol} ({from_date.date()} – {to_date.date()}). "
                     f"MT5 error: {mt5.last_error()}"
                 )
-            df = pd.DataFrame(rates)
+            df = pd.concat(chunks, ignore_index=True)
             df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+            df = df.sort_values("time").reset_index(drop=True)
+            df = df[(df["time"] >= pd.Timestamp(from_date)) & (df["time"] <= pd.Timestamp(to_date))]
+            if df.empty:
+                raise RuntimeError(
+                    f"No {name} data for {symbol} after clipping ({from_date.date()} – {to_date.date()}). "
+                    f"MT5 error: {mt5.last_error()}"
+                )
             data[name] = df
             print(f"[DATA] {name}: {len(df):,} bars")
     finally:
@@ -705,10 +797,19 @@ def save_results(
                 "lot_size": t.lot_size,
                 "close_price": round(t.close_price, 5) if t.close_price else None,
                 "close_reason": t.close_reason,
-                "stage_at_close": t.stage,
+                "stage_at_close": t.close_stage,
                 "pnl_usd": round(t.pnl_full, 2),
                 "r_multiple": round(t.r_multiple, 3),
                 "initial_risk_points": t.initial_risk_points,
+                "signal_time": t.signal_time,
+                "h1_bias": t.h1_bias,
+                "h4_bias": t.h4_bias,
+                "integrated_bias": t.integrated_bias,
+                "bias_alignment": t.bias_alignment,
+                "session_label": t.session_label,
+                "day_of_week": t.day_of_week,
+                "mfe_r": round(t.mfe_r, 3),
+                "mae_r": round(t.mae_r, 3),
             }
             for t in trades
         ]

@@ -1,7 +1,10 @@
 import MetaTrader5 as mt5
 import os
 import numpy as np
+from datetime import datetime, timezone
 from dotenv import load_dotenv
+from risk_engine import RiskEngine
+from execution_quality import ExecutionQualityMonitor
 
 load_dotenv()
 
@@ -14,6 +17,8 @@ SL_MULTIPLIER = 1.5  # Stop Loss = 1.5 * ATR
 
 # Global MT5 connection state
 _mt5_initialized = False
+risk_engine = RiskEngine()
+quality_monitor = ExecutionQualityMonitor()
 
 
 def _initialize_mt5():
@@ -77,9 +82,6 @@ def calculate_dynamic_lot_size(symbol, risk_percent=RISK_PER_TRADE, sl_multiplie
             print("[RISK] Failed to get account info")
             return MIN_LOT_SIZE
         
-        account_equity = account.equity
-        risk_dollars = account_equity * risk_percent
-        
         # Get symbol info
         symbol_info = mt5.symbol_info(symbol)
         if not symbol_info:
@@ -101,29 +103,12 @@ def calculate_dynamic_lot_size(symbol, risk_percent=RISK_PER_TRADE, sl_multiplie
         # Stop Loss = 1.5 * ATR (in pips)
         sl_pips = atr_pips * sl_multiplier
         
-        # Get the contract value (how much 1 pip = in dollars)
-        # For XAUUSD: 1 pip = 0.01 USD per lot
-        # For other symbols: 1 pip = varies by symbol
-        contract_size = symbol_info.trade_contract_size or 1000
-        pip_value_per_lot = (point * contract_size)
-        
-        # Calculate SL distance in dollars per lot
-        sl_dollars_per_lot = sl_pips * pip_value_per_lot
-        
-        if sl_dollars_per_lot == 0:
-            print("[RISK] SL calculation resulted in zero, using fixed lot 0.01")
-            return MIN_LOT_SIZE
-        
-        # Final lot size
-        lot_size = risk_dollars / sl_dollars_per_lot
-        
-        # Broker constraints
-        lot_size = max(MIN_LOT_SIZE, min(lot_size, MAX_LOT_SIZE))
-        
-        # Round to 2 decimals
-        lot_size = round(lot_size, 2)
-        
-        print(f"[RISK ENGINE] {symbol} | Equity: ${account_equity:.2f} | ATR: {atr:.5f} | SL: {sl_pips:.1f} pips | Lot: {lot_size}")
+        lot_size = risk_engine.calculate_position_size(
+            symbol=symbol,
+            stop_loss_pips=sl_pips,
+        )
+
+        print(f"[RISK ENGINE] {symbol} | Equity: ${account.equity:.2f} | ATR: {atr:.5f} | SL: {sl_pips:.1f} pips | Lot: {lot_size}")
         
         return lot_size
     
@@ -155,9 +140,21 @@ def execute_market_order(symbol, action, lot_size=None, sl_pips=None, tp_pips=No
     if tp_pips is None:
         tp_pips = sl_pips * 2  # 2:1 reward-to-risk ratio
 
+    decision = risk_engine.pre_trade_check(
+        symbol=symbol,
+        action=action,
+        timeframe="1m",
+        source="mt5_executor",
+        purpose="OPEN",
+    )
+    if not decision.allowed:
+        print(f"[RISK BLOCK] {decision.code}: {decision.message}")
+        return None
+
     # Determine order type
     order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
-    price = mt5.symbol_info_tick(symbol).ask if action == "BUY" else mt5.symbol_info_tick(symbol).bid
+    tick = mt5.symbol_info_tick(symbol)
+    price = tick.ask if action == "BUY" else tick.bid
     
     # Calculate SL/TP levels
     point = mt5.symbol_info(symbol).point
@@ -178,7 +175,27 @@ def execute_market_order(symbol, action, lot_size=None, sl_pips=None, tp_pips=No
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
+    symbol_info = mt5.symbol_info(symbol)
+    spread_points = ((tick.ask - tick.bid) / symbol_info.point) if symbol_info and symbol_info.point else 0.0
+    order_send_ts = datetime.now(timezone.utc)
     result = mt5.order_send(request)
+    order_send_done_ts = datetime.now(timezone.utc)
+    if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+        quality_monitor.record_fill(
+            source="mt5_executor",
+            symbol=symbol,
+            action=action,
+            timeframe="1m",
+            order_ticket=int(result.order) if getattr(result, "order", 0) else None,
+            deal_ticket=int(result.deal) if getattr(result, "deal", 0) else None,
+            signal_ts=None,
+            signal_bar_time=None,
+            signal_bar_relation=None,
+            order_send_ts=order_send_ts,
+            order_send_done_ts=order_send_done_ts,
+            intended_price=float(price),
+            spread_points=float(spread_points),
+        )
     # NOTE: Do NOT shutdown() here - keeps persistent connection for scanner
     return result
 
@@ -229,6 +246,17 @@ def partial_close_position(ticket, percentage=0.5):
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
+
+    decision = risk_engine.pre_trade_check(
+        symbol=symbol,
+        action="CLOSE",
+        timeframe="1m",
+        source="mt5_executor",
+        purpose="CLOSE",
+    )
+    if not decision.allowed:
+        print(f"[RISK BLOCK] {decision.code}: {decision.message}")
+        return None
 
     result = mt5.order_send(request)
     mt5.shutdown()

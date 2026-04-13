@@ -1,9 +1,14 @@
 import MetaTrader5 as mt5
 import os
 from pathlib import Path
+import sys
 from dotenv import load_dotenv
 
+sys.path.append(str(Path(__file__).resolve().parent / "ai-engine"))
+from risk_engine import RiskEngine
+
 load_dotenv(Path(__file__).resolve().parent / "ai-engine" / ".env")
+risk_engine = RiskEngine()
 
 def test_connection():
     # 1. Initialize MT5 with your .env credentials
@@ -47,6 +52,18 @@ def test_connection():
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
+
+    decision = risk_engine.pre_trade_check(
+        symbol=symbol,
+        action="BUY",
+        timeframe="1m",
+        source="debug_mt5_pipe",
+        purpose="OPEN",
+    )
+    if not decision.allowed:
+        print(f"❌ Risk blocked test order: {decision.code} {decision.message}")
+        mt5.shutdown()
+        return
 
     result = mt5.order_send(request)
     

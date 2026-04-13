@@ -1,0 +1,6 @@
+filter,trades,win_rate_pct,avg_return_points,marginal_win_rate_vs_baseline,marginal_avg_return_vs_baseline
+baseline,723,49.38,0.4067,0.0,0.0
+market_structure,8,25.0,-4.0162,-24.38,-4.4229
+volume_profile,363,49.59,0.0861,0.21,-0.3206
+orderflow_delta,473,47.36,-0.0382,-2.02,-0.4449
+session_volatility,397,48.11,0.6344,-1.27,0.2277

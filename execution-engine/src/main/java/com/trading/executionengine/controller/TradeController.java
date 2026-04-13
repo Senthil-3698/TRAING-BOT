@@ -6,7 +6,6 @@ import com.trading.executionengine.entity.Trade;
 import com.trading.executionengine.entity.TradeEvent;
 import com.trading.executionengine.repository.TradeRepository;
 import com.trading.executionengine.repository.TradeEventRepository;
-import com.trading.executionengine.service.RiskManagerService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
@@ -29,21 +28,17 @@ import java.util.UUID;
 @RestController
 public class TradeController {
 
-    private static final double DEFAULT_ACCOUNT_BALANCE = 10_000.0;
     private static final double DEFAULT_STOP_LOSS_PIPS = 50.0;
 
-    private final RiskManagerService riskManagerService;
     private final TradeRepository tradeRepository;
     private final TradeEventRepository tradeEventRepository;
     private final String mt5BridgeUrl;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public TradeController(
-            RiskManagerService riskManagerService,
             TradeRepository tradeRepository,
             TradeEventRepository tradeEventRepository,
             @Value("${mt5.bridge.url:http://localhost:9000/execute}") String mt5BridgeUrl) {
-        this.riskManagerService = riskManagerService;
         this.tradeRepository = tradeRepository;
         this.tradeEventRepository = tradeEventRepository;
         this.mt5BridgeUrl = mt5BridgeUrl;
@@ -56,15 +51,6 @@ public class TradeController {
                 || request.action() == null || request.action().isBlank()
                 || request.timeframe() == null || request.timeframe().isBlank()
                 || request.confidenceScore() == null) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Risk Manager rejected trade.");
-        }
-
-        double positionSize = riskManagerService.calculatePositionSize(
-                DEFAULT_ACCOUNT_BALANCE,
-                DEFAULT_STOP_LOSS_PIPS,
-                request.symbol());
-
-        if (positionSize <= 0) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Risk Manager rejected trade.");
         }
 
@@ -81,13 +67,13 @@ public class TradeController {
 
         tradeRepository.save(trade);
 
-        double liveVolume = positionSize > 0 && positionSize < 0.01 ? 0.01 : positionSize;
+        // Authoritative risk and sizing now run in Python RiskEngine (broker bridge).
         String bridgePayload = String.format(
             "{\"symbol\":\"%s\",\"action\":\"%s\",\"timeframe\":\"%s\",\"volume\":%.2f,\"stop_loss_pips\":%.2f,\"take_profit_pips\":%.2f,\"confidence_score\":%.4f}",
             request.symbol().toUpperCase(),
             request.action().toUpperCase(),
             request.timeframe().toLowerCase(),
-            liveVolume,
+            0.01,
             DEFAULT_STOP_LOSS_PIPS,
             DEFAULT_STOP_LOSS_PIPS * 2,
             request.confidenceScore()

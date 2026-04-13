@@ -34,7 +34,18 @@ def get_integrated_bias(symbol):
     return "NO_CONFLUENCE"
 
 
-def track_active_trade(ticket, entry_price, sl, tp):
+def track_active_trade(
+    ticket,
+    entry_price,
+    sl,
+    tp,
+    *,
+    symbol=None,
+    action=None,
+    timeframe=None,
+    setup_type=None,
+    opened_at=None,
+):
     """
     Stores a newly opened trade in Redis so the Exit Manager can manage stages.
     """
@@ -45,6 +56,11 @@ def track_active_trade(ticket, entry_price, sl, tp):
         "sl": sl,
         "tp": tp,
         "stage": "ENTRY",
+        "symbol": symbol,
+        "action": action,
+        "timeframe": timeframe,
+        "setup_type": setup_type,
+        "opened_at": opened_at,
     }
     r.set(key, json.dumps(trade_state))
     r.set(f"trade_stage:{ticket}", "ENTRY")

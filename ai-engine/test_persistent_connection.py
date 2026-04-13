@@ -7,8 +7,10 @@ from dotenv import load_dotenv
 import os
 from pathlib import Path
 import time
+from risk_engine import RiskEngine
 
 load_dotenv(Path('.env'))
+risk_engine = RiskEngine()
 
 print("[TEST] Starting persistent MT5 connection test...")
 
@@ -41,6 +43,18 @@ request = {
     "type_time": mt5.ORDER_TIME_GTC,
     "type_filling": mt5.ORDER_FILLING_IOC,
 }
+
+decision = risk_engine.pre_trade_check(
+    symbol="XAUUSD",
+    action="BUY",
+    timeframe="1m",
+    source="test_persistent_connection",
+    purpose="OPEN",
+)
+if not decision.allowed:
+    print(f"[RISK BLOCK] {decision.code}: {decision.message}")
+    mt5.shutdown()
+    exit(1)
 
 result = mt5.order_send(request)
 print(f"[RESULT] retcode={result.retcode}, comment={result.comment}")
