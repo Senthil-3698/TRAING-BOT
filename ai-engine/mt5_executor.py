@@ -20,8 +20,9 @@ _mt5_initialized = False
 risk_engine = RiskEngine()
 quality_monitor = ExecutionQualityMonitor()
 
-HF_XAUUSD_SL_POINTS = 100  # 10 pips = 100 points
-HF_XAUUSD_TP_POINTS = 150  # 15 pips = 150 points
+MAX_SLIPPAGE_POINTS = 5  # 0.5 pips on XAUUSD point convention
+HIT_RUN_SL_POINTS = 100  # 10 pips
+HIT_RUN_TP_POINTS = 100  # 10 pips
 
 
 def _initialize_mt5():
@@ -130,18 +131,12 @@ def execute_market_order(symbol, action, lot_size=None, sl_pips=None, tp_pips=No
     if lot_size is None:
         lot_size = calculate_dynamic_lot_size(symbol)
     
-    # Use 1.5*ATR for SL if not specified, default TP = 2*SL
+    # Hit-and-run strict risk profile: fixed 10 pips SL / 10 pips TP.
     if sl_pips is None:
-        atr = calculate_atr(symbol, mt5.TIMEFRAME_M5, period=ATR_PERIOD)
-        if atr:
-            point = mt5.symbol_info(symbol).point
-            point_value = 1 if symbol == "XAUUSD" else 10
-            sl_pips = (atr / point / point_value) * SL_MULTIPLIER
-        else:
-            sl_pips = 50  # Fallback
+        sl_pips = HIT_RUN_SL_POINTS
     
     if tp_pips is None:
-        tp_pips = sl_pips * 2  # 2:1 reward-to-risk ratio
+        tp_pips = HIT_RUN_TP_POINTS
 
     decision = risk_engine.pre_trade_check(
         symbol=symbol,
@@ -158,9 +153,19 @@ def execute_market_order(symbol, action, lot_size=None, sl_pips=None, tp_pips=No
     order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
     tick = mt5.symbol_info_tick(symbol)
     price = tick.ask if action == "BUY" else tick.bid
+
+    symbol_info = mt5.symbol_info(symbol)
+    filling_mode = mt5.ORDER_FILLING_IOC
+    if symbol_info is not None:
+        allowed_mode = getattr(symbol_info, "filling_mode", None)
+        if allowed_mode in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK):
+            filling_mode = allowed_mode
+        elif allowed_mode == mt5.ORDER_FILLING_RETURN:
+            # RETURN is less strict for scalping; prefer IOC if available in environment.
+            filling_mode = mt5.ORDER_FILLING_IOC
     
     # Calculate SL/TP levels
-    point = mt5.symbol_info(symbol).point
+    point = symbol_info.point if symbol_info else mt5.symbol_info(symbol).point
     sl = price - (sl_pips * point) if action == "BUY" else price + (sl_pips * point)
     tp = price + (tp_pips * point) if action == "BUY" else price - (tp_pips * point)
 
@@ -170,19 +175,28 @@ def execute_market_order(symbol, action, lot_size=None, sl_pips=None, tp_pips=No
         "volume": lot_size,
         "type": order_type,
         "price": price,
+        "deviation": MAX_SLIPPAGE_POINTS,
         "sl": sl,
         "tp": tp,
         "magic": 123456,
         "comment": "Sentinel AI Execution",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": filling_mode,
     }
 
-    symbol_info = mt5.symbol_info(symbol)
     spread_points = ((tick.ask - tick.bid) / symbol_info.point) if symbol_info and symbol_info.point else 0.0
     order_send_ts = datetime.now(timezone.utc)
     result = mt5.order_send(request)
     order_send_done_ts = datetime.now(timezone.utc)
+
+    if result is not None and result.retcode in {
+        mt5.TRADE_RETCODE_REQUOTE,
+        mt5.TRADE_RETCODE_PRICE_CHANGED,
+        mt5.TRADE_RETCODE_PRICE_OFF,
+    }:
+        print("[BROKER REJECT] Slippage exceeded limit. Order Cancelled.")
+        return result
+
     if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
         quality_monitor.record_fill(
             source="mt5_executor",
@@ -208,11 +222,10 @@ def execute_trade(action, symbol, timeframe, lot_size=None, sl_pips=None, tp_pip
     Compatibility wrapper for autonomous scanners that expect execute_trade().
     Uses dynamic positioning by default (calculates lot based on ATR and account equity).
     """
-    # High-frequency scalping profile for XAUUSD: fixed, tight exits.
-    # Keep explicit points to avoid ambiguity between pip/point conventions.
-    if symbol == "XAUUSD":
-        sl_pips = HF_XAUUSD_SL_POINTS
-        tp_pips = HF_XAUUSD_TP_POINTS
+    if sl_pips is None:
+        sl_pips = HIT_RUN_SL_POINTS
+    if tp_pips is None:
+        tp_pips = HIT_RUN_TP_POINTS
 
     return execute_market_order(symbol, action, lot_size, sl_pips, tp_pips)
 

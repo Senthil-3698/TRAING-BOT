@@ -13,6 +13,8 @@ from trade_journal import TradeJournal
 
 journal = TradeJournal()
 MAX_SCALP_SPREAD_POINTS = float(os.getenv("MAX_SCALP_SPREAD_POINTS", "20"))
+ATR_PERIOD = 14
+MIN_VOLATILITY_THRESHOLD = float(os.getenv("MIN_VOLATILITY_THRESHOLD", "0.50"))
 
 
 def count_open_positions(symbol: str = "XAUUSD") -> int:
@@ -83,39 +85,93 @@ def compute_tick_ema_crossover(ticks_df: pd.DataFrame) -> tuple[str | None, dict
     }
 
 
+def calculate_m1_atr(symbol: str, period: int = ATR_PERIOD) -> float | None:
+    """Calculate 1-minute ATR using a simple rolling true-range mean."""
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, period + 2)
+    if rates is None or len(rates) < period + 1:
+        return None
+
+    df = pd.DataFrame(rates)
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift(1)).abs()
+    low_close = (df["low"] - df["close"].shift(1)).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(period, min_periods=period).mean().iloc[-1]
+    if pd.isna(atr):
+        return None
+    return float(atr)
+
+
 def analyze_and_trade() -> None:
     symbol = "XAUUSD"
     max_positions = 5
 
-    print("[SCANNER] TICK-MOMENTUM SNIPER ACTIVATED")
-    print("[CONFIG] Trigger: 50-tick EMA cross 100-tick EMA | Input: last 1000 ticks")
-    print(f"[CONFIG] Spread Shield: <={MAX_SCALP_SPREAD_POINTS:.1f} points | Max Positions: 5 | Poll: 0.2s")
+    print("[SCANNER] RUBBER BAND ENGINE ACTIVATED")
+    print("[CONFIG] Mean Reversion: Bollinger(20,2) + RSI(2)")
+    print("[CONFIG] BUY: tick < LowerBand and RSI2 < 10 | SELL: tick > UpperBand and RSI2 > 90")
+    print(f"[CONFIG] Spread Shield: <={MAX_SCALP_SPREAD_POINTS:.1f} points | Max Positions: 5 | Poll: 1.0s")
     print()
     last_heartbeat = 0.0
 
     while True:
         try:
-            ticks_df = get_tick_data(symbol, count=1000)
-            if ticks_df is None:
-                time.sleep(0.2)
+            # Build 1-minute indicator context (Bollinger 20,2 + RSI 2)
+            m1_rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 60)
+            if m1_rates is None or len(m1_rates) < 25:
+                time.sleep(1.0)
                 continue
 
-            signal_action, tick_details = compute_tick_ema_crossover(ticks_df)
+            m1_df = pd.DataFrame(m1_rates)
+            close = m1_df["close"].astype(float)
+            bb_mid = close.rolling(window=20).mean().iloc[-1]
+            bb_std = close.rolling(window=20).std(ddof=0).iloc[-1]
+            if pd.isna(bb_mid) or pd.isna(bb_std):
+                time.sleep(1.0)
+                continue
+
+            bb_upper = float(bb_mid + (2.0 * bb_std))
+            bb_lower = float(bb_mid - (2.0 * bb_std))
+
+            delta = close.diff()
+            gain = delta.clip(lower=0.0)
+            loss = -delta.clip(upper=0.0)
+            avg_gain = gain.rolling(window=2).mean().iloc[-1]
+            avg_loss = loss.rolling(window=2).mean().iloc[-1]
+            if pd.isna(avg_gain) or pd.isna(avg_loss):
+                time.sleep(1.0)
+                continue
+            if avg_loss == 0:
+                rsi2 = 100.0
+            else:
+                rs = float(avg_gain / avg_loss)
+                rsi2 = float(100.0 - (100.0 / (1.0 + rs)))
+
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                time.sleep(1.0)
+                continue
+            current_price = float((tick.bid + tick.ask) / 2.0)
+
+            buy_signal = current_price < bb_lower and rsi2 < 10.0
+            sell_signal = current_price > bb_upper and rsi2 > 90.0
+            signal_action = "BUY" if buy_signal else "SELL" if sell_signal else None
+
             if signal_action is None:
                 now = time.time()
                 if (now - last_heartbeat) >= 1.0:
-                    tick = mt5.symbol_info_tick(symbol)
                     info = mt5.symbol_info(symbol)
                     spread_points = ((tick.ask - tick.bid) / info.point) if tick and info and info.point else None
                     spread_txt = f"{spread_points:.1f}" if spread_points is not None else "NA"
                     spread_ok = spread_points is not None and spread_points <= MAX_SCALP_SPREAD_POINTS
-                    print(f"[WAIT] No tick cross | Spread={spread_txt} ({'OK' if spread_ok else 'HIGH'})")
+                    print(
+                        f"[WAIT] No snap-back | Price={current_price:.2f} BB_L={bb_lower:.2f} BB_U={bb_upper:.2f} "
+                        f"RSI2={rsi2:.1f} Spread={spread_txt} ({'OK' if spread_ok else 'HIGH'})"
+                    )
                     last_heartbeat = now
-                time.sleep(0.2)
+                time.sleep(1.0)
                 continue
 
-            tick_time = ticks_df["time"].iloc[-1]
-            current_price = float(ticks_df["tick_price"].iloc[-1])
+            tick_time = datetime.now(timezone.utc)
             current_positions = count_open_positions(symbol)
             spread_pass, spread_reason, spread_points = filter_micro_spread(symbol)
             spread_txt = f"{spread_points:.1f}" if spread_points is not None else "NA"
@@ -131,9 +187,9 @@ def analyze_and_trade() -> None:
                     source="autonomous_scanner",
                     symbol=symbol,
                     action=signal_action,
-                    timeframe="tick",
+                    timeframe="1m",
                     signal_ts=tick_time.to_pydatetime(),
-                    rsi_value=None,
+                    rsi_value=float(rsi2),
                     ema_distance=None,
                     atr_value=None,
                     m5_trend=None,
@@ -147,27 +203,31 @@ def analyze_and_trade() -> None:
                     decision_status="REJECTED",
                     rejection_reason="; ".join(rejection_reasons),
                     metadata={
-                        "setup_type": "TICK_EMA_CROSS_SCALP",
-                        "tick_ema_fast_50": float(tick_details.get("ema_fast_50", 0.0)),
-                        "tick_ema_slow_100": float(tick_details.get("ema_slow_100", 0.0)),
-                        "tick_ema_gap": float(tick_details.get("ema_gap", 0.0)),
+                        "setup_type": "RUBBER_BAND_SCALP",
+                        "bb_upper": bb_upper,
+                        "bb_lower": bb_lower,
+                        "rsi2": float(rsi2),
                         "spread_points": float(spread_points) if spread_points is not None else None,
                         "spread_reason": spread_reason,
                         "current_positions": current_positions,
                     },
                 )
-                print(f"[MONITOR] Tick cross={signal_action} vetoed | Spread={spread_txt} | Pos={current_positions}/5")
-                time.sleep(0.2)
+                print(f"[MONITOR] Snap-back={signal_action} vetoed | Spread={spread_txt} | Pos={current_positions}/5")
+                time.sleep(1.0)
                 continue
 
-            ema_gap = abs(float(tick_details.get("ema_gap", 0.0)))
-            confidence = max(0.0, min(1.0, ema_gap / max(current_price * 0.0001, 1e-6)))
+            # Confidence scales with band excursion distance.
+            if signal_action == "BUY":
+                excursion = max(0.0, bb_lower - current_price)
+            else:
+                excursion = max(0.0, current_price - bb_upper)
+            confidence = max(0.0, min(1.0, excursion / max(current_price * 0.0005, 1e-6)))
 
             signal = {
                 "source": "autonomous_scanner",
-                "setup_type": "TICK_EMA_CROSS_SCALP",
+                "setup_type": "RUBBER_BAND_SCALP",
                 "symbol": symbol,
-                "timeframe": "tick",
+                "timeframe": "1m",
                 "action": signal_action,
                 "timestamp": tick_time.timestamp(),
                 "signal_bar_time": tick_time.isoformat(),
@@ -175,9 +235,9 @@ def analyze_and_trade() -> None:
                 "intended_price": float(current_price),
                 "confidence_score": round(confidence, 4),
                 "indicators": {
-                    "tick_ema_fast_50": float(tick_details.get("ema_fast_50", 0.0)),
-                    "tick_ema_slow_100": float(tick_details.get("ema_slow_100", 0.0)),
-                    "tick_ema_gap": float(tick_details.get("ema_gap", 0.0)),
+                    "bb_upper": bb_upper,
+                    "bb_lower": bb_lower,
+                    "rsi2": float(rsi2),
                     "filter_spread_reason": spread_reason,
                     "spread_points": float(spread_points) if spread_points is not None else None,
                 },
@@ -185,15 +245,14 @@ def analyze_and_trade() -> None:
 
             asyncio.run(on_signal_received(signal))
             print(
-                f"[TICK SIGNAL] {signal_action} | Price={current_price:.2f} | "
-                f"EMA50={tick_details['ema_fast_50']:.4f} EMA100={tick_details['ema_slow_100']:.4f} | "
-                f"Spread={spread_txt}"
+                f"[RUBBER BAND] {signal_action} | Price={current_price:.2f} | "
+                f"BB_L={bb_lower:.2f} BB_U={bb_upper:.2f} RSI2={rsi2:.1f} | Spread={spread_txt}"
             )
 
         except Exception as error:
             print(f"[ERROR] {error}")
 
-        time.sleep(0.2)
+        time.sleep(1.0)
 
 
 def run_filter_ablation_backtest(symbol: str = "XAUUSD", days: int = 90, lookahead_bars: int = 15) -> None:

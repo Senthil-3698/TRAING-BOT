@@ -31,6 +31,10 @@ AUTO_TUNE_CHECK_SECONDS = 300
 EXIT_SCAN_INTERVAL_SECONDS = 0.5
 BE_TRIGGER_POINTS = 50  # 5 pips = 50 points
 BE_LOCK_POINTS = 10     # 1 pip = 10 points
+BE_TRIGGER_ATR_MULTIPLE = 1.0
+SHADOW_TRIGGER_POINTS = 30  # 3 pips = 30 points
+SHADOW_TRAIL_POINTS = 20    # 2 pips = 20 points
+TIME_BOMB_SECONDS = 180     # 3 minutes
 
 
 def _get_tracked_trade(ticket):
@@ -310,182 +314,79 @@ def log_trade_event(ticket, event_type):
         print(f"EVENT LOG FAILED for {ticket}: {error}")
 
 def manage_exits():
-    if not mt5.initialize(): return
-
-    last_tune_check_at = 0.0
+    if not mt5.initialize():
+        return
 
     while True:
-        now_epoch = time.time()
-        if (now_epoch - last_tune_check_at) >= AUTO_TUNE_CHECK_SECONDS:
-            try:
-                tune_result = auto_tune_partial_r_if_due(min_new_trades=100)
-                status = tune_result.get("status") if isinstance(tune_result, dict) else "unknown"
-                if status == "tuned":
-                    print(f"[PARTIAL-TUNE] Updated partial target to {tune_result.get('best_partial_r')}R")
-            except Exception as error:
-                print(f"[PARTIAL-TUNE] check failed: {error}")
-            last_tune_check_at = now_epoch
-
-        # 1. Get all open positions managed by our bot (using Magic Number)
         positions = mt5.positions_get(magic=123456) or []
-        
+
         for pos in positions:
             symbol = pos.symbol
             ticket = pos.ticket
-            entry = pos.price_open
-            current_price = pos.price_current
-            current_sl = pos.sl
-            point = mt5.symbol_info(symbol).point
+            entry = float(pos.price_open)
+            current_price = float(pos.price_current)
+            current_sl = float(pos.sl or 0.0)
+            tp = float(pos.tp or 0.0)
 
-            tracked_trade = _get_tracked_trade(ticket)
-            trade_stage = _get_trade_stage(ticket, tracked_trade)
-            if trade_stage in {"BREAKEVEN", "TRAILING"}:
-                # Allow partial-close management to run after breakeven.
-                pass
-
-            initial_sl = None
-            if tracked_trade and tracked_trade.get("sl") is not None:
-                try:
-                    initial_sl = float(tracked_trade.get("sl"))
-                except (ValueError, TypeError):
-                    initial_sl = None
-
-            if initial_sl is None:
-                initial_sl = current_sl
-
-            now = datetime.now(timezone.utc)
-
-            if tracked_trade is None:
-                tracked_trade = {}
-
-            opened_at = _safe_to_datetime(tracked_trade.get("opened_at"))
-            if opened_at is None:
-                opened_at = datetime.fromtimestamp(int(getattr(pos, "time", time.time())), tz=timezone.utc)
-                tracked_trade["opened_at"] = opened_at.isoformat()
-                r.set(f"trade:{ticket}", json.dumps(tracked_trade, default=str))
-
-            trend_score = tracked_trade.get("entry_trend_score")
-            if trend_score is None:
-                entry_score, entry_details = _trend_strength_score(symbol)
-                tracked_trade["entry_trend_score"] = float(entry_score)
-                tracked_trade["trend_score"] = float(entry_score)
-                tracked_trade["trend_score_details"] = entry_details
-                tracked_trade["trend_score_updated_at"] = now.isoformat()
-                trend_score = entry_score
-                r.set(f"trade:{ticket}", json.dumps(tracked_trade, default=str))
-
-            updated_at = _safe_to_datetime(tracked_trade.get("trend_score_updated_at"))
-            if updated_at is None or (now - updated_at).total_seconds() >= TREND_REFRESH_SECONDS:
-                live_score, live_details = _trend_strength_score(symbol)
-                tracked_trade["trend_score"] = float(live_score)
-                tracked_trade["trend_score_details"] = live_details
-                tracked_trade["trend_score_updated_at"] = now.isoformat()
-                trend_score = live_score
-                r.set(f"trade:{ticket}", json.dumps(tracked_trade, default=str))
-            else:
-                trend_score = float(tracked_trade.get("trend_score", trend_score))
-            
-            # Calculate Risk (R) dynamically from the original SL stored in Redis.
-            risk_points = abs(entry - initial_sl)
-            if risk_points <= 0:
-                continue
-
-            progress_r = _r_progress(pos.type, entry, current_price, risk_points)
-            max_r = float(tracked_trade.get("max_r", -999.0))
-            if progress_r > max_r:
-                tracked_trade["max_r"] = float(progress_r)
-                r.set(f"trade:{ticket}", json.dumps(tracked_trade, default=str))
-
-            full_exit_r, runner_trail_r, trend_profile = _trend_exit_profile(float(trend_score))
-
-            shield_mode, _ = get_market_volatility(symbol)
-            be_lock_distance = BE_LOCK_POINTS * point
-            if pos.type == mt5.ORDER_TYPE_BUY:
-                profit_points = (current_price - entry) / point
-            else:
-                profit_points = (entry - current_price) / point
-
-            # Time-based hard exit for M1 scalps: no +1R within 45 min.
-            timeframe = str(tracked_trade.get("timeframe", "1m")).lower()
-            if timeframe in {"1m", "m1"} and opened_at is not None:
-                elapsed_min = (now - opened_at).total_seconds() / 60.0
-                if elapsed_min >= TIME_EXIT_MINUTES_M1 and float(tracked_trade.get("max_r", progress_r)) < 1.0:
-                    if _close_position_market(ticket):
-                        update_trade_stage(ticket, "TIME_EXIT")
-                        log_trade_event(ticket, "TIME_EXIT_45M_NO_1R")
-                        print(f"TIME EXIT: {ticket} closed after {elapsed_min:.1f}m without reaching +1R.")
-                    continue
-
-            # Structure-based hard exit on opposing shift.
-            shift_detected, shift_reason = _opposing_structure_shift(symbol, pos.type)
-            if shift_detected:
+            opened_at_epoch = float(getattr(pos, "time", 0) or 0)
+            open_seconds = max(0.0, time.time() - opened_at_epoch) if opened_at_epoch > 0 else 0.0
+            if open_seconds >= TIME_BOMB_SECONDS:
                 if _close_position_market(ticket):
-                    update_trade_stage(ticket, "STRUCTURE_EXIT")
-                    log_trade_event(ticket, "STRUCTURE_SHIFT_EXIT")
-                    print(f"STRUCTURE EXIT: {ticket} closed. {shift_reason}")
-                continue
-            
-            # 2. Hyper-Aggressive Layer 1: move to break-even + 1 pip as soon as +5 pips are reached.
-            if pos.type == mt5.ORDER_TYPE_BUY:
-                target_sl = entry + be_lock_distance
-                if profit_points > BE_TRIGGER_POINTS and current_sl < target_sl:
-                    modify_sl(ticket, target_sl, pos.tp)
-                    update_trade_stage(ticket, "BREAKEVEN")
-                    log_trade_event(ticket, "BE")
-                    print(f"Shield {shield_mode}: BUY {ticket} moved to BE+1pip at +{profit_points:.1f} points.")
-            
-            elif pos.type == mt5.ORDER_TYPE_SELL:
-                target_sl = entry - be_lock_distance
-                if profit_points > BE_TRIGGER_POINTS and ((current_sl == 0.0) or (current_sl > target_sl)):
-                    modify_sl(ticket, target_sl, pos.tp)
-                    update_trade_stage(ticket, "BREAKEVEN")
-                    log_trade_event(ticket, "BE")
-                    print(f"Shield {shield_mode}: SELL {ticket} moved to BE+1pip at +{profit_points:.1f} points.")
-
-            # 3. Layer 2: Partial Close (auto-tuned R level)
-            stage = _get_trade_stage(ticket, tracked_trade)
-
-            if stage == "BREAKEVEN":
-                partial_r = _get_partial_r_multiple()
-                take_profit_target = entry + (risk_points * partial_r) if pos.type == mt5.ORDER_TYPE_BUY else entry - (risk_points * partial_r)
-
-                reached_target = (current_price >= take_profit_target) if pos.type == mt5.ORDER_TYPE_BUY else (current_price <= take_profit_target)
-
-                if reached_target:
-                    print(f"Target {partial_r:.2f}R reached for {ticket}. Scaling out 50%.")
-                    res = partial_close_position(ticket, 0.5)
-                    if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                        update_trade_stage(ticket, "PARTIAL_CLOSED")
-                        log_trade_event(ticket, f"PARTIAL_CLOSE_{partial_r:.2f}R")
-
-            stage = _get_trade_stage(ticket, tracked_trade)
-            if stage == "PARTIAL_CLOSED":
-                # Dynamic full target on runner.
-                full_target_price = entry + (risk_points * full_exit_r) if pos.type == mt5.ORDER_TYPE_BUY else entry - (risk_points * full_exit_r)
-                full_target_hit = (current_price >= full_target_price) if pos.type == mt5.ORDER_TYPE_BUY else (current_price <= full_target_price)
-                if full_target_hit:
-                    if _close_position_market(ticket):
-                        update_trade_stage(ticket, "FULL_EXIT")
-                        log_trade_event(ticket, f"FULL_EXIT_{full_exit_r}R_{trend_profile}")
-                        print(f"FULL EXIT: {ticket} closed at dynamic target {full_exit_r}R ({trend_profile}).")
-                    continue
-
-                # Adaptive trailing on runner based on trend profile.
-                trail_distance = risk_points * runner_trail_r
-                if pos.type == mt5.ORDER_TYPE_BUY:
-                    proposed_sl = current_price - trail_distance
-                    if proposed_sl > current_sl and proposed_sl > entry:
-                        modify_sl(ticket, proposed_sl, pos.tp)
-                        update_trade_stage(ticket, "TRAILING")
-                        log_trade_event(ticket, f"TRAIL_UPDATE_{runner_trail_r}R_{trend_profile}")
+                    update_trade_stage(ticket, "TIME_EXPIRED")
+                    log_trade_event(ticket, "TIME_EXPIRED")
+                    print("[TIME EXPIRED] Closing stagnant position to free up margin.")
                 else:
-                    proposed_sl = current_price + trail_distance
-                    if (current_sl == 0.0) or (proposed_sl < current_sl and proposed_sl < entry):
-                        modify_sl(ticket, proposed_sl, pos.tp)
-                        update_trade_stage(ticket, "TRAILING")
-                        log_trade_event(ticket, f"TRAIL_UPDATE_{runner_trail_r}R_{trend_profile}")
+                    print(f"[TIME EXPIRED] Failed to close stagnant position {ticket}.")
+                continue
 
-        time.sleep(EXIT_SCAN_INTERVAL_SECONDS)  # Hyper-aggressive scan cadence
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None or symbol_info.point <= 0:
+                continue
+
+            point = symbol_info.point
+            be_lock_distance = BE_LOCK_POINTS * point
+            trigger_distance = SHADOW_TRIGGER_POINTS * point
+            trail_distance = SHADOW_TRAIL_POINTS * point
+
+            if pos.type == mt5.ORDER_TYPE_BUY:
+                profit_distance = current_price - entry
+                be_sl = entry + be_lock_distance
+
+                if profit_distance >= trigger_distance:
+                    if current_sl < be_sl:
+                        modify_sl(ticket, be_sl, tp)
+                        update_trade_stage(ticket, "BREAKEVEN")
+                        log_trade_event(ticket, "BE")
+                        print(f"[SHADOW] BUY {ticket} locked BE+1pip at +{profit_distance/point:.1f} points")
+                        current_sl = be_sl
+
+                    proposed_sl = max(be_sl, current_price - trail_distance)
+                    if proposed_sl > current_sl:
+                        modify_sl(ticket, proposed_sl, tp)
+                        update_trade_stage(ticket, "TRAILING")
+                        log_trade_event(ticket, "SHADOW_TRAIL")
+                        print(f"[SHADOW] BUY {ticket} trailed to {proposed_sl:.2f}")
+
+            elif pos.type == mt5.ORDER_TYPE_SELL:
+                profit_distance = entry - current_price
+                be_sl = entry - be_lock_distance
+
+                if profit_distance >= trigger_distance:
+                    if (current_sl == 0.0) or (current_sl > be_sl):
+                        modify_sl(ticket, be_sl, tp)
+                        update_trade_stage(ticket, "BREAKEVEN")
+                        log_trade_event(ticket, "BE")
+                        print(f"[SHADOW] SELL {ticket} locked BE+1pip at +{profit_distance/point:.1f} points")
+                        current_sl = be_sl
+
+                    proposed_sl = min(be_sl, current_price + trail_distance)
+                    if (current_sl == 0.0) or (proposed_sl < current_sl):
+                        modify_sl(ticket, proposed_sl, tp)
+                        update_trade_stage(ticket, "TRAILING")
+                        log_trade_event(ticket, "SHADOW_TRAIL")
+                        print(f"[SHADOW] SELL {ticket} trailed to {proposed_sl:.2f}")
+
+        time.sleep(EXIT_SCAN_INTERVAL_SECONDS)
 
 def modify_sl(ticket, new_sl, current_tp):
     position = mt5.positions_get(ticket=ticket)
