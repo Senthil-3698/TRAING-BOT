@@ -1,8 +1,11 @@
 import asyncio
 import httpx
+import os
 from state_manager import get_integrated_bias, track_active_trade
 from news_aggregator import fetch_macro_news
 from strategist import validate_with_ai
+
+EXECUTION_ENGINE_URL = os.getenv("EXECUTION_ENGINE_URL", "http://localhost:8081/execute")
 
 async def on_signal_received(signal):
     """
@@ -50,7 +53,7 @@ async def on_signal_received(signal):
 
         try:
             async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
-                response = await client.post("http://localhost:8080/execute", json=payload)
+                response = await client.post(EXECUTION_ENGINE_URL, json=payload)
 
             if response.status_code == 200:
                 try:

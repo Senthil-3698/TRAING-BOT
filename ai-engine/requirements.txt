@@ -7,3 +7,4 @@ uvicorn
 MetaTrader5
 rich
 psycopg[binary]
+pandas

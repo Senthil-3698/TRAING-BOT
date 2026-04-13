@@ -1,28 +1,165 @@
 import MetaTrader5 as mt5
 import os
+import numpy as np
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ===== RISK MANAGEMENT PARAMETERS =====
+RISK_PER_TRADE = 0.02  # Risk 2% of account per trade
+MIN_LOT_SIZE = 0.01
+MAX_LOT_SIZE = 100.0
+ATR_PERIOD = 14
+SL_MULTIPLIER = 1.5  # Stop Loss = 1.5 * ATR
+
+# Global MT5 connection state
+_mt5_initialized = False
+
 
 def _initialize_mt5():
-    return mt5.initialize(
+    """Initialize MT5 if not already initialized. Keeps persistent connection."""
+    global _mt5_initialized
+    if _mt5_initialized:
+        return True
+    
+    if mt5.initialize(
         login=int(os.getenv("MT5_LOGIN")),
         password=os.getenv("MT5_PASS"),
         server=os.getenv("MT5_SERVER"),
-    )
+    ):
+        _mt5_initialized = True
+        return True
+    return False
 
-def execute_market_order(symbol, action, lot_size, sl_pips, tp_pips):
-    # Initialize connection to the MT5 terminal on your laptop
-    if not _initialize_mt5():
-        print("MT5 initialize() failed")
+
+def calculate_atr(symbol, timeframe, period=ATR_PERIOD):
+    """
+    Calculate Average True Range (ATR) to determine dynamic Stop Loss distance.
+    ATR measures market volatility - higher ATR = wider SL needed = smaller lots.
+    """
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, period + 1)
+    if rates is None or len(rates) < period + 1:
+        print(f"[ATR] Failed to fetch {period + 1} candles for {symbol}")
         return None
+    
+    # Calculate True Range for each candle
+    high = rates['high']
+    low = rates['low']
+    close = np.roll(rates['close'], 1)  # Previous close
+    
+    tr1 = high - low
+    tr2 = np.abs(high - close)
+    tr3 = np.abs(low - close)
+    
+    tr = np.maximum(tr1, np.maximum(tr2, tr3))
+    atr = np.mean(tr[-period:])  # Average of last `period` TR values
+    
+    return atr
+
+
+def calculate_dynamic_lot_size(symbol, risk_percent=RISK_PER_TRADE, sl_multiplier=SL_MULTIPLIER):
+    """
+    Institutional Risk Engine: Calculate exact lot size based on:
+    1. Account equity (2% per trade)
+    2. ATR-based Stop Loss distance (1.5 * ATR)
+    3. Broker constraints (min 0.01, max 100.0)
+    
+    Formula: Lot Size = (Account Equity * Risk%) / (SL Distance in Currency)
+    """
+    if not _initialize_mt5():
+        print("[RISK] MT5 connection failed")
+        return MIN_LOT_SIZE
+    
+    try:
+        # Get account info
+        account = mt5.account_info()
+        if not account:
+            print("[RISK] Failed to get account info")
+            return MIN_LOT_SIZE
+        
+        account_equity = account.equity
+        risk_dollars = account_equity * risk_percent
+        
+        # Get symbol info
+        symbol_info = mt5.symbol_info(symbol)
+        if not symbol_info:
+            print(f"[RISK] Failed to get {symbol} info, using fixed lot 0.01")
+            return MIN_LOT_SIZE
+        
+        point = symbol_info.point
+        
+        # Calculate ATR-based SL distance (in pips)
+        atr = calculate_atr(symbol, mt5.TIMEFRAME_M5, period=ATR_PERIOD)
+        if atr is None:
+            print("[RISK] ATR calculation failed, using fixed lot 0.01")
+            return MIN_LOT_SIZE
+        
+        # Convert ATR (in price units) to pips
+        point_value = 1 if symbol == "XAUUSD" else 10  # Gold scales differently
+        atr_pips = (atr / point) / point_value
+        
+        # Stop Loss = 1.5 * ATR (in pips)
+        sl_pips = atr_pips * sl_multiplier
+        
+        # Get the contract value (how much 1 pip = in dollars)
+        # For XAUUSD: 1 pip = 0.01 USD per lot
+        # For other symbols: 1 pip = varies by symbol
+        contract_size = symbol_info.trade_contract_size or 1000
+        pip_value_per_lot = (point * contract_size)
+        
+        # Calculate SL distance in dollars per lot
+        sl_dollars_per_lot = sl_pips * pip_value_per_lot
+        
+        if sl_dollars_per_lot == 0:
+            print("[RISK] SL calculation resulted in zero, using fixed lot 0.01")
+            return MIN_LOT_SIZE
+        
+        # Final lot size
+        lot_size = risk_dollars / sl_dollars_per_lot
+        
+        # Broker constraints
+        lot_size = max(MIN_LOT_SIZE, min(lot_size, MAX_LOT_SIZE))
+        
+        # Round to 2 decimals
+        lot_size = round(lot_size, 2)
+        
+        print(f"[RISK ENGINE] {symbol} | Equity: ${account_equity:.2f} | ATR: {atr:.5f} | SL: {sl_pips:.1f} pips | Lot: {lot_size}")
+        
+        return lot_size
+    
+    except Exception as e:
+        print(f"[RISK ERROR] {e}")
+        return MIN_LOT_SIZE
+
+
+def execute_market_order(symbol, action, lot_size=None, sl_pips=None, tp_pips=None):
+    # Initialize connection (or reuse persistent one)
+    if not _initialize_mt5():
+        print("[ERROR] MT5 initialize() failed")
+        return None
+
+    # Use dynamic lot sizing if not specified
+    if lot_size is None:
+        lot_size = calculate_dynamic_lot_size(symbol)
+    
+    # Use 1.5*ATR for SL if not specified, default TP = 2*SL
+    if sl_pips is None:
+        atr = calculate_atr(symbol, mt5.TIMEFRAME_M5, period=ATR_PERIOD)
+        if atr:
+            point = mt5.symbol_info(symbol).point
+            point_value = 1 if symbol == "XAUUSD" else 10
+            sl_pips = (atr / point / point_value) * SL_MULTIPLIER
+        else:
+            sl_pips = 50  # Fallback
+    
+    if tp_pips is None:
+        tp_pips = sl_pips * 2  # 2:1 reward-to-risk ratio
 
     # Determine order type
     order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
     price = mt5.symbol_info_tick(symbol).ask if action == "BUY" else mt5.symbol_info_tick(symbol).bid
     
-    # Calculate SL/TP levels based on your 7-year trading edge logic
+    # Calculate SL/TP levels
     point = mt5.symbol_info(symbol).point
     sl = price - (sl_pips * point) if action == "BUY" else price + (sl_pips * point)
     tp = price + (tp_pips * point) if action == "BUY" else price - (tp_pips * point)
@@ -35,15 +172,23 @@ def execute_market_order(symbol, action, lot_size, sl_pips, tp_pips):
         "price": price,
         "sl": sl,
         "tp": tp,
-        "magic": 123456,  # Your bot's unique ID
+        "magic": 123456,
         "comment": "Sentinel AI Execution",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
     result = mt5.order_send(request)
-    mt5.shutdown()
+    # NOTE: Do NOT shutdown() here - keeps persistent connection for scanner
     return result
+
+
+def execute_trade(action, symbol, timeframe, lot_size=None, sl_pips=None, tp_pips=None):
+    """
+    Compatibility wrapper for autonomous scanners that expect execute_trade().
+    Uses dynamic positioning by default (calculates lot based on ATR and account equity).
+    """
+    return execute_market_order(symbol, action, lot_size, sl_pips, tp_pips)
 
 
 def partial_close_position(ticket, percentage=0.5):

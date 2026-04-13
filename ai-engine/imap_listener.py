@@ -6,8 +6,13 @@ import time
 import redis
 import json
 import re
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 from orchestrator import on_signal_received
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Connect to our Local Redis Cache
 r = redis.Redis(
@@ -19,30 +24,47 @@ r = redis.Redis(
 def parse_signal(subject, body):
     """
     Advanced Trader Logic: Extracts Asset, Timeframe, and Action.
-    Example Subject: "Alert: XAUUSD 5m BUY"
+    Body-first parsing is more reliable when TradingView subject formats change.
     """
-    # Look for common symbols and timeframes in the message
-    symbol_match = re.search(r'(XAUUSD|EURUSD|BTCUSD)', subject.upper())
-    tf_match = re.search(r'(\d+[m|h|d])', subject.lower())
-    action_match = re.search(r'(BUY|SELL)', body.upper())
+    subject_upper = subject.upper()
+    body_upper = body.upper()
 
-    if all([symbol_match, tf_match, action_match]):
+    # Look for common symbols and timeframes in either subject or body.
+    symbol_match = re.search(r'(XAUUSD|EURUSD|BTCUSD)', subject_upper) or re.search(
+        r'(XAUUSD|EURUSD|BTCUSD)', body_upper
+    )
+    tf_match = re.search(r'(\d+(?:m|h|d))', subject.lower()) or re.search(
+        r'(\d+(?:m|h|d))', body.lower()
+    )
+
+    # Body-first action detection.
+    if "BUY" in body_upper:
+        action = "BUY"
+    elif "SELL" in body_upper:
+        action = "SELL"
+    else:
+        action_match = re.search(r'(BUY|SELL)', subject_upper)
+        action = action_match.group(1) if action_match else None
+
+    if symbol_match and tf_match and action:
         return {
             "symbol": symbol_match.group(1),
             "timeframe": tf_match.group(1),
-            "action": action_match.group(1),
+            "action": action,
             "timestamp": time.time()
         }
     return None
 
 def listen_for_alerts():
-    # Use credentials from your .env later
     print("Agent Active: Listening for TradingView signals...")
 
-    # Replace these with environment-backed secrets in production.
-    imap_host = "imap.gmail.com"
-    imap_user = "your_email@example.com"
-    imap_password = "your_password"
+    imap_host = os.getenv("IMAP_HOST", "imap.gmail.com")
+    imap_user = os.getenv("EMAIL_USER", "")
+    imap_password = os.getenv("EMAIL_PASS", "")
+
+    if not imap_user or not imap_password:
+        print("IMAP credentials missing in .env (EMAIL_USER/EMAIL_PASS).")
+        return
 
     # Logic for checking inbox every 1 second
     while True:
@@ -51,7 +73,8 @@ def listen_for_alerts():
                 mail.login(imap_user, imap_password)
                 mail.select("INBOX")
 
-                status, message_ids = mail.search(None, 'UNSEEN')
+                # Search all mail from TradingView instead of only unread mail.
+                status, message_ids = mail.search(None, '(FROM "noreply@tradingview.com")')
                 if status != "OK":
                     time.sleep(1)
                     continue
