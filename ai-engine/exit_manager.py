@@ -31,6 +31,7 @@ PARTIAL_R_MAX = 2.0
 PARTIAL_R_DEFAULT = 1.5
 AUTO_TUNE_CHECK_SECONDS = 300
 EXIT_SCAN_INTERVAL_SECONDS = 0.5
+BOT_MAGIC_ID = int(os.getenv("BOT_MAGIC_IDS", "123456").split(",")[0].strip())
 BE_TRIGGER_POINTS = 50  # 5 pips = 50 points
 BE_LOCK_POINTS = 10     # 1 pip = 10 points
 BE_TRIGGER_ATR_MULTIPLE = 1.0
@@ -342,8 +343,18 @@ def manage_exits():
     if not mt5.initialize():
         return
 
+    last_auto_tune = 0.0
+
     while True:
-        positions = mt5.positions_get(magic=123456) or []
+        now = time.time()
+        if (now - last_auto_tune) >= AUTO_TUNE_CHECK_SECONDS:
+            try:
+                auto_tune_partial_r_if_due()
+            except Exception as error:
+                print(f"[EXIT AUTO TUNE] skipped: {error}")
+            last_auto_tune = now
+
+        positions = mt5.positions_get(magic=BOT_MAGIC_ID) or []
 
         for pos in positions:
             symbol = pos.symbol
@@ -352,22 +363,28 @@ def manage_exits():
             current_price = float(pos.price_current)
             current_sl = float(pos.sl or 0.0)
             tp = float(pos.tp or 0.0)
+            tracked_trade = _get_tracked_trade(ticket)
+            trade_stage = _get_trade_stage(ticket, tracked_trade)
 
             # Get symbol info early for use in all checks
             symbol_info = mt5.symbol_info(symbol)
             if symbol_info is None or symbol_info.point <= 0:
                 continue
 
+            point = symbol_info.point
+            volatility_mode, volatility_multiplier = get_market_volatility(symbol)
+            trend_score, _trend_details = _trend_strength_score(symbol)
+            _trend_full_exit_r, trend_trail_multiplier, trend_label = _trend_exit_profile(trend_score)
+
             opened_at_epoch = float(getattr(pos, "time", 0) or 0)
             open_seconds = max(0.0, time.time() - opened_at_epoch) if opened_at_epoch > 0 else 0.0
             
             # TIME_BOMB: Only close if trade is at or below breakeven after TIME_BOMB_SECONDS
             if open_seconds >= TIME_BOMB_SECONDS:
-                pnl_usd = float(pos.profit) if hasattr(pos, 'profit') and pos.profit is not None else 0.0
-                # Convert USD P&L to points: pnl_usd / (point_value * contract_size)
-                point_value = symbol_info.point
-                contract_size = symbol_info.trade_contract_size or 100.0
-                pnl_points = pnl_usd / (point_value * contract_size) if (point_value * contract_size) > 0 else 0.0
+                if pos.type == mt5.ORDER_TYPE_BUY:
+                    pnl_points = (current_price - entry) / point
+                else:
+                    pnl_points = (entry - current_price) / point
                 
                 # Close only if breakeven or losing (pnl <= tolerance threshold)
                 if pnl_points <= TIME_BOMB_BE_TOLERANCE_POINTS:
@@ -394,10 +411,19 @@ def manage_exits():
                     # Trade is profitable, don't force-close even though it's been open > 3 min
                     print(f"[TIME BOMB SKIP] {ticket} profitable at {pnl_points:.1f} points, allowing to run")
 
-            point = symbol_info.point
             be_lock_distance = BE_LOCK_POINTS * point
-            trigger_distance = SHADOW_TRIGGER_POINTS * point
-            trail_distance = SHADOW_TRAIL_POINTS * point
+            trigger_distance = SHADOW_TRIGGER_POINTS * point * volatility_multiplier
+            trail_distance = SHADOW_TRAIL_POINTS * point * trend_trail_multiplier
+
+            # Structural failure exit: if market structure shifts against an already-protected trade, flatten.
+            if trade_stage in {"BREAKEVEN", "TRAILING", "PARTIAL"}:
+                shift, reason = _opposing_structure_shift(symbol, pos.type)
+                if shift:
+                    if _close_position_market(ticket):
+                        update_trade_stage(ticket, "STRUCTURE_EXIT")
+                        log_trade_event(ticket, "FULL_EXIT")
+                        print(f"[STRUCTURE EXIT] {ticket}: {reason}")
+                    continue
 
             if pos.type == mt5.ORDER_TYPE_BUY:
                 profit_distance = current_price - entry
@@ -416,7 +442,7 @@ def manage_exits():
                         modify_sl(ticket, proposed_sl, tp)
                         update_trade_stage(ticket, "TRAILING")
                         log_trade_event(ticket, "SHADOW_TRAIL")
-                        print(f"[SHADOW] BUY {ticket} trailed to {proposed_sl:.2f}")
+                        print(f"[SHADOW] BUY {ticket} trailed to {proposed_sl:.2f} ({volatility_mode}/{trend_label})")
 
             elif pos.type == mt5.ORDER_TYPE_SELL:
                 profit_distance = entry - current_price
@@ -435,14 +461,21 @@ def manage_exits():
                         modify_sl(ticket, proposed_sl, tp)
                         update_trade_stage(ticket, "TRAILING")
                         log_trade_event(ticket, "SHADOW_TRAIL")
-                        print(f"[SHADOW] SELL {ticket} trailed to {proposed_sl:.2f}")
+                        print(f"[SHADOW] SELL {ticket} trailed to {proposed_sl:.2f} ({volatility_mode}/{trend_label})")
 
             # PARTIAL CLOSE: Execute if position has reached target R-multiple
             try:
                 partial_r_multiple = _get_partial_r_multiple()
-                tracked = _get_tracked_trade(ticket)
-                if tracked and tracked.get('stop_loss_pips') and tracked.get('stop_loss_pips') > 0:
-                    risk_points = tracked['stop_loss_pips'] * symbol_info.point
+                if trade_stage not in {"PARTIAL", "TIME_EXPIRED", "CLOSED"}:
+                    risk_points = 0.0
+                    if tracked_trade and tracked_trade.get("stop_loss_pips"):
+                        risk_points = float(tracked_trade["stop_loss_pips"]) * point
+                    elif current_sl > 0:
+                        risk_points = abs(entry - current_sl)
+
+                    if risk_points <= 0:
+                        continue
+
                     r_progress = _r_progress(pos.type, entry, current_price, risk_points)
                     
                     # If position has reached partial close R-multiple threshold
