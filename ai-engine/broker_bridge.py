@@ -115,7 +115,7 @@ def execute_trade(request: LiveTradeRequest):
         "sl": stop_loss,
         "tp": take_profit,
         "deviation": 20,
-        "magic": 20260411,
+        "magic": 123456,
         "comment": f"TRADING {request.timeframe} live execution",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,

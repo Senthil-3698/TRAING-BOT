@@ -47,15 +47,15 @@ def calculate_atr(symbol, timeframe, period=ATR_PERIOD):
         print(f"[ATR] Failed to fetch {period + 1} candles for {symbol}")
         return None
     
-    # Calculate True Range for each candle
-    high = rates['high']
-    low = rates['low']
-    close = np.roll(rates['close'], 1)  # Previous close
-    
+    # Calculate True Range for each candle (skip index 0, no previous close for it)
+    high = rates['high'][1:]
+    low = rates['low'][1:]
+    prev_close = rates['close'][:-1]
+
     tr1 = high - low
-    tr2 = np.abs(high - close)
-    tr3 = np.abs(low - close)
-    
+    tr2 = np.abs(high - prev_close)
+    tr3 = np.abs(low - prev_close)
+
     tr = np.maximum(tr1, np.maximum(tr2, tr3))
     atr = np.mean(tr[-period:])  # Average of last `period` TR values
     

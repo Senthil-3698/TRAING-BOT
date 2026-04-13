@@ -1,6 +1,7 @@
 import redis
 import json
 import os
+import numpy as np
 
 # Connection to the Docker Redis instance we started
 r = redis.Redis(
@@ -8,6 +9,52 @@ r = redis.Redis(
     port=int(os.getenv("REDIS_PORT", "6380")),
     db=0,
 )
+
+def auto_update_bias(symbol):
+    """
+    Reads live H1 and H4 candles from MT5, computes EMA50 on each,
+    and writes the resulting bias to Redis. Call this before checking
+    get_integrated_bias() so the filter is always current.
+    Returns the computed (h1_bias, h4_bias) tuple.
+    """
+    try:
+        import MetaTrader5 as mt5
+
+        _TF_MAP = {
+            "1h": mt5.TIMEFRAME_H1,
+            "4h": mt5.TIMEFRAME_H4,
+        }
+
+        results = {}
+        for label, tf in _TF_MAP.items():
+            rates = mt5.copy_rates_from_pos(symbol, tf, 0, 60)
+            if rates is None or len(rates) < 55:
+                results[label] = "NEUTRAL"
+                continue
+
+            closes = np.array([r["close"] for r in rates], dtype=float)
+            # EMA-50 using pandas-free Wilder smoothing
+            k = 2.0 / (50 + 1)
+            ema = closes[0]
+            for c in closes[1:]:
+                ema = c * k + ema * (1 - k)
+
+            current_price = closes[-1]
+            if current_price > ema * 1.0003:        # price at least 0.03% above EMA
+                results[label] = "BULLISH"
+            elif current_price < ema * 0.9997:      # price at least 0.03% below EMA
+                results[label] = "BEARISH"
+            else:
+                results[label] = "NEUTRAL"
+
+            set_market_bias(symbol, label, results[label])
+
+        return results.get("1h", "NEUTRAL"), results.get("4h", "NEUTRAL")
+
+    except Exception as e:
+        print(f"[BIAS] auto_update_bias failed: {e}")
+        return "NEUTRAL", "NEUTRAL"
+
 
 def set_market_bias(symbol, timeframe, bias):
     """
