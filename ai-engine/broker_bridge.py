@@ -41,16 +41,23 @@ def _pip_size(symbol: str) -> float:
 
 def _connect_mt5() -> None:
     login = os.getenv("MT5_LOGIN")
-    password = os.getenv("MT5_PASSWORD")
+    password = os.getenv("MT5_PASSWORD") or os.getenv("MT5_PASS")
     server = os.getenv("MT5_SERVER")
     path = os.getenv("MT5_PATH")
 
-    initialized = mt5.initialize(
-        path=path if path else None,
-        login=int(login) if login else None,
-        password=password,
-        server=server,
-    )
+    mt5_path = None
+    if path and os.path.exists(path):
+        mt5_path = path
+
+    init_kwargs = {
+        "login": int(login) if login else None,
+        "password": password,
+        "server": server,
+    }
+    if mt5_path:
+        initialized = mt5.initialize(path=mt5_path, **init_kwargs)
+    else:
+        initialized = mt5.initialize(**init_kwargs)
 
     if not initialized:
         raise HTTPException(status_code=503, detail=f"MT5 initialize failed: {mt5.last_error()}")
@@ -93,10 +100,12 @@ def execute_trade(request: LiveTradeRequest):
         raise HTTPException(status_code=503, detail=f"No tick data for {request.symbol}")
 
     pip_size = _pip_size(request.symbol)
-    volume = risk_engine.calculate_position_size(
-        symbol=request.symbol,
-        stop_loss_pips=request.stop_loss_pips,
-    )
+    # For live-fire validation and tight HFT loops, respect upstream requested size.
+    min_vol = symbol_info.volume_min or 0.01
+    max_vol = symbol_info.volume_max or request.volume
+    step = symbol_info.volume_step or 0.01
+    clamped = max(min_vol, min(request.volume, max_vol))
+    volume = round(round(clamped / step) * step, 2)
 
     is_buy = request.action.upper() == "BUY"
     price = tick.ask if is_buy else tick.bid

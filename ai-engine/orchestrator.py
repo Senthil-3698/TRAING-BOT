@@ -44,6 +44,7 @@ async def on_signal_received(signal):
     symbol = signal['symbol']
     tf = signal['timeframe']
     action = signal['action']
+    setup_type = signal.get("setup_type")
     intermarket_context = None
     regime_context = get_current_regime(symbol, timeframe="M5")
     signal["market_regime"] = regime_context.get("regime", "UNKNOWN")
@@ -112,30 +113,46 @@ async def on_signal_received(signal):
         ai_context = f"{news_context}\nINTERMARKET_CONTEXT: {intermarket_context.get('summary', '')}"
         ai_context = f"{ai_context}\n{regime_summary}"
 
-    # 3. AI Final Veto (The Strategist)
-    ai_result = await validate_with_ai({
-        **signal,
-        "context": ai_context,
-        "intermarket_context": intermarket_context,
-        "market_regime": regime_context.get("regime"),
-        "regime_context": regime_context,
-    }, macro_bias=trend) or {}
+    bypass_ai_for_tick_scalper = os.getenv("BYPASS_AI_FOR_TICK_SCALPER", "1") == "1"
+    is_tick_fastpath = (str(tf).lower() == "tick") and (setup_type == "TICK_EMA_CROSS_SCALP")
 
-    if isinstance(ai_result, dict):
-        decision = ai_result.get("decision", "REJECTED")
-        reason = ai_result.get("reason", ai_result.get("reasoning", ""))
-        ai_confidence = ai_result.get("confidence", signal.get("confidence_score"))
-        ai_structured = {
-            "primary_thesis": ai_result.get("primary_thesis"),
-            "top_3_risks": ai_result.get("top_3_risks"),
-            "invalidation_level": ai_result.get("invalidation_level"),
-            "expected_hold_time_minutes": ai_result.get("expected_hold_time_minutes"),
-            "suggested_size_multiplier_0_to_1": ai_result.get("suggested_size_multiplier_0_to_1"),
-        }
-    else:
-        decision, reason = ai_result
+    if bypass_ai_for_tick_scalper and is_tick_fastpath:
+        decision = "APPROVED"
+        reason = "Tick fast-path approval (AI bypass enabled)."
         ai_confidence = signal.get("confidence_score")
-        ai_structured = None
+        ai_structured = {
+            "primary_thesis": "Tick EMA momentum fast path",
+            "top_3_risks": None,
+            "invalidation_level": None,
+            "expected_hold_time_minutes": 2,
+            "suggested_size_multiplier_0_to_1": 1.0,
+        }
+        print("[ORCHESTRATOR] AI bypass active for tick scalper signal.")
+    else:
+        # 3. AI Final Veto (The Strategist)
+        ai_result = await validate_with_ai({
+            **signal,
+            "context": ai_context,
+            "intermarket_context": intermarket_context,
+            "market_regime": regime_context.get("regime"),
+            "regime_context": regime_context,
+        }, macro_bias=trend) or {}
+
+        if isinstance(ai_result, dict):
+            decision = ai_result.get("decision", "REJECTED")
+            reason = ai_result.get("reason", ai_result.get("reasoning", ""))
+            ai_confidence = ai_result.get("confidence", signal.get("confidence_score"))
+            ai_structured = {
+                "primary_thesis": ai_result.get("primary_thesis"),
+                "top_3_risks": ai_result.get("top_3_risks"),
+                "invalidation_level": ai_result.get("invalidation_level"),
+                "expected_hold_time_minutes": ai_result.get("expected_hold_time_minutes"),
+                "suggested_size_multiplier_0_to_1": ai_result.get("suggested_size_multiplier_0_to_1"),
+            }
+        else:
+            decision, reason = ai_result
+            ai_confidence = signal.get("confidence_score")
+            ai_structured = None
 
     if isinstance(decision, str) and decision.upper() in {"APPROVED", "REJECTED"}:
         decision = decision.upper()
@@ -149,7 +166,7 @@ async def on_signal_received(signal):
             "symbol": symbol,
             "action": action,
             "timeframe": tf,
-            "confidence_score": signal.get("confidence_score", 0),
+            "confidenceScore": signal.get("confidence_score", 0),
             "signal_timestamp": signal.get("timestamp"),
             "signal_bar_time": signal.get("signal_bar_time"),
             "signal_bar_relation": signal.get("signal_bar_relation"),

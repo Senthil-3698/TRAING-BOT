@@ -1,5 +1,6 @@
 ﻿import argparse
 import asyncio
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -11,6 +12,7 @@ from orchestrator import on_signal_received
 from trade_journal import TradeJournal
 
 journal = TradeJournal()
+MAX_SCALP_SPREAD_POINTS = float(os.getenv("MAX_SCALP_SPREAD_POINTS", "20"))
 
 
 def count_open_positions(symbol: str = "XAUUSD") -> int:
@@ -20,7 +22,7 @@ def count_open_positions(symbol: str = "XAUUSD") -> int:
     return len([p for p in positions if p.magic == 123456])
 
 
-def filter_micro_spread(symbol: str = "XAUUSD", max_spread_points: float = 15.0) -> tuple[bool, str, float | None]:
+def filter_micro_spread(symbol: str = "XAUUSD", max_spread_points: float = MAX_SCALP_SPREAD_POINTS) -> tuple[bool, str, float | None]:
     """Allow scalps only when spread is tight enough for micro targets."""
     tick = mt5.symbol_info_tick(symbol)
     info = mt5.symbol_info(symbol)
@@ -87,8 +89,9 @@ def analyze_and_trade() -> None:
 
     print("[SCANNER] TICK-MOMENTUM SNIPER ACTIVATED")
     print("[CONFIG] Trigger: 50-tick EMA cross 100-tick EMA | Input: last 1000 ticks")
-    print("[CONFIG] Spread Shield: <=15 points | Max Positions: 5 | Poll: 0.2s")
+    print(f"[CONFIG] Spread Shield: <={MAX_SCALP_SPREAD_POINTS:.1f} points | Max Positions: 5 | Poll: 0.2s")
     print()
+    last_heartbeat = 0.0
 
     while True:
         try:
@@ -99,6 +102,15 @@ def analyze_and_trade() -> None:
 
             signal_action, tick_details = compute_tick_ema_crossover(ticks_df)
             if signal_action is None:
+                now = time.time()
+                if (now - last_heartbeat) >= 1.0:
+                    tick = mt5.symbol_info_tick(symbol)
+                    info = mt5.symbol_info(symbol)
+                    spread_points = ((tick.ask - tick.bid) / info.point) if tick and info and info.point else None
+                    spread_txt = f"{spread_points:.1f}" if spread_points is not None else "NA"
+                    spread_ok = spread_points is not None and spread_points <= MAX_SCALP_SPREAD_POINTS
+                    print(f"[WAIT] No tick cross | Spread={spread_txt} ({'OK' if spread_ok else 'HIGH'})")
+                    last_heartbeat = now
                 time.sleep(0.2)
                 continue
 

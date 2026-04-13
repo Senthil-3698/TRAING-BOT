@@ -367,7 +367,8 @@ class RiskEngine:
                 )
 
         current_spread, avg_spread = self._spread_points(symbol)
-        if avg_spread > 0 and current_spread > (2.0 * avg_spread):
+        bypass_spread_sanity = os.getenv("RISK_BYPASS_SPREAD_SANITY", "0") == "1"
+        if (not bypass_spread_sanity) and avg_spread > 0 and current_spread > (2.0 * avg_spread):
             return self._reject(
                 code="SPREAD_SANITY",
                 message="Spread is above 2x average spread.",
@@ -391,6 +392,38 @@ class RiskEngine:
                 "week_pnl": week_pnl,
             },
         )
+
+    def calculate_position_size(
+        self,
+        *,
+        symbol: str,
+        stop_loss_pips: float,
+    ) -> float:
+        """Volatility-aware position sizing using fractional Kelly with broker limits."""
+        if not self._ensure_mt5():
+            return 0.01
+
+        account = mt5.account_info()
+        if account is None or stop_loss_pips <= 0:
+            return 0.01
+
+        info = mt5.symbol_info(symbol)
+        if info is None or info.point <= 0:
+            return 0.01
+
+        risk_fraction = self._kelly_risk_fraction(symbol)
+        equity = float(account.equity)
+        risk_dollars = equity * risk_fraction
+
+        pip_value_per_lot = info.point * (info.trade_contract_size or 100)
+        sl_dollars_per_lot = stop_loss_pips * pip_value_per_lot
+        if sl_dollars_per_lot <= 0:
+            return float(info.volume_min or 0.01)
+
+        raw = risk_dollars / sl_dollars_per_lot
+        capped = max(info.volume_min or 0.01, min(raw, info.volume_max or raw))
+        step = info.volume_step or 0.01
+        return round(round(capped / step) * step, 2)
 
         def calculate_position_size(
                 self,
