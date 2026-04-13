@@ -10,6 +10,21 @@ r = redis.Redis(
     db=0,
 )
 
+
+def _safe_get(key):
+    try:
+        return r.get(key)
+    except Exception:
+        return None
+
+
+def _safe_set(key, value):
+    try:
+        r.set(key, value)
+        return True
+    except Exception:
+        return False
+
 def auto_update_bias(symbol):
     """
     Reads live H1 and H4 candles from MT5, computes EMA50 on each,
@@ -62,15 +77,15 @@ def set_market_bias(symbol, timeframe, bias):
     Example: set_market_bias('XAUUSD', '4h', 'BULLISH')
     """
     key = f"{symbol}:{timeframe}:bias"
-    r.set(key, bias)
+    _safe_set(key, bias)
     print(f"STATE UPDATED: {symbol} {timeframe} is now {bias}")
 
 def get_integrated_bias(symbol):
     """
     The Scalper's Filter: Checks if 1h and 4h are aligned.
     """
-    h1 = r.get(f"{symbol}:1h:bias")
-    h4 = r.get(f"{symbol}:4h:bias")
+    h1 = _safe_get(f"{symbol}:1h:bias")
+    h4 = _safe_get(f"{symbol}:4h:bias")
     
     # Decodes bytes to string if they exist
     h1 = h1.decode('utf-8') if h1 else "NEUTRAL"
@@ -109,8 +124,8 @@ def track_active_trade(
         "setup_type": setup_type,
         "opened_at": opened_at,
     }
-    r.set(key, json.dumps(trade_state))
-    r.set(f"trade_stage:{ticket}", "ENTRY")
+    _safe_set(key, json.dumps(trade_state))
+    _safe_set(f"trade_stage:{ticket}", "ENTRY")
     print(f"TRADE TRACKED: {ticket} set to ENTRY")
 
 
@@ -119,7 +134,7 @@ def update_trade_stage(ticket, new_stage):
     Updates trade lifecycle stage, e.g. ENTRY -> BREAKEVEN -> TRAILING.
     """
     key = f"trade:{ticket}"
-    trade_raw = r.get(key)
+    trade_raw = _safe_get(key)
 
     if not trade_raw:
         print(f"TRADE NOT FOUND: {ticket}")
@@ -127,7 +142,7 @@ def update_trade_stage(ticket, new_stage):
 
     trade_state = json.loads(trade_raw.decode("utf-8"))
     trade_state["stage"] = new_stage
-    r.set(key, json.dumps(trade_state))
-    r.set(f"trade_stage:{ticket}", new_stage)
+    _safe_set(key, json.dumps(trade_state))
+    _safe_set(f"trade_stage:{ticket}", new_stage)
     print(f"TRADE STAGE UPDATED: {ticket} -> {new_stage}")
     return True

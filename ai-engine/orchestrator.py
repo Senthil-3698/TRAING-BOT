@@ -46,7 +46,11 @@ async def on_signal_received(signal):
     action = signal['action']
     setup_type = signal.get("setup_type")
     intermarket_context = None
-    regime_context = get_current_regime(symbol, timeframe="M5")
+    try:
+        regime_context = get_current_regime(symbol, timeframe="M5")
+    except Exception as error:
+        regime_context = {"regime": "UNKNOWN", "reason": f"regime_detector_unavailable: {error}", "features": {}}
+        print(f"[ORCHESTRATOR] Regime detector unavailable, continuing fast-path: {error}")
     signal["market_regime"] = regime_context.get("regime", "UNKNOWN")
     signal["regime_context"] = regime_context
 
@@ -198,17 +202,20 @@ async def on_signal_received(signal):
                     tp = result.get("tp")
                     order_ticket = result.get("order")
                     if result.get("order") and entry_price is not None and sl is not None and tp is not None:
-                        track_active_trade(
-                            result.get("order"),
-                            entry_price,
-                            sl,
-                            tp,
-                            symbol=symbol,
-                            action=action,
-                            timeframe=tf,
-                            setup_type=signal.get("setup_type"),
-                            opened_at=datetime.now(timezone.utc).isoformat(),
-                        )
+                        try:
+                            track_active_trade(
+                                result.get("order"),
+                                entry_price,
+                                sl,
+                                tp,
+                                symbol=symbol,
+                                action=action,
+                                timeframe=tf,
+                                setup_type=signal.get("setup_type"),
+                                opened_at=datetime.now(timezone.utc).isoformat(),
+                            )
+                        except Exception as track_error:
+                            print(f"[ORCHESTRATOR] Track state skipped (Redis unavailable): {track_error}")
                 except ValueError:
                     print("Execution engine response was not JSON; skipped trade tracking.")
                     result = {}

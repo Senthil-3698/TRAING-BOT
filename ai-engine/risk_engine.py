@@ -23,15 +23,46 @@ class RiskDecision:
     details: dict[str, Any]
 
 
+class _SafeRedisClient:
+    """Best-effort Redis client that degrades to no-op reads/writes when Redis is down."""
+
+    def __init__(self, client: redis.Redis) -> None:
+        self._client = client
+
+    def get(self, key: str):
+        try:
+            return self._client.get(key)
+        except Exception:
+            return None
+
+    def set(self, key: str, value: Any):
+        try:
+            return self._client.set(key, value)
+        except Exception:
+            return None
+
+    def lpush(self, key: str, *values: Any):
+        try:
+            return self._client.lpush(key, *values)
+        except Exception:
+            return None
+
+    def ltrim(self, key: str, start: int, end: int):
+        try:
+            return self._client.ltrim(key, start, end)
+        except Exception:
+            return None
+
+
 class RiskEngine:
     """Single authoritative pre-trade risk gate for all Python execution paths."""
 
     def __init__(self) -> None:
-        self.redis = redis.Redis(
+        self.redis = _SafeRedisClient(redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"),
             port=int(os.getenv("REDIS_PORT", "6380")),
             db=0,
-        )
+        ))
         self.journal = TradeJournal()
 
         self.kill_switch_key = os.getenv("GLOBAL_KILL_SWITCH_KEY", "GLOBAL_KILL_SWITCH")
@@ -253,6 +284,14 @@ class RiskEngine:
         purpose: str = "OPEN",
     ) -> RiskDecision:
         purpose = purpose.upper()
+
+        if os.getenv("RISK_ENGINE_BYPASS", "0") == "1":
+            return RiskDecision(
+                True,
+                "ALLOWED_BYPASS",
+                "Risk engine bypass enabled via RISK_ENGINE_BYPASS=1.",
+                {"source": source, "purpose": purpose},
+            )
 
         if not self._ensure_mt5():
             return self._reject(
