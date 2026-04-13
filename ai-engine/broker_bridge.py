@@ -10,16 +10,22 @@ from pydantic import BaseModel, Field
 from risk_engine import RiskEngine
 from execution_quality import ExecutionQualityMonitor
 from alerts import send_telegram_alert
+from execution_stress_wrapper import ExecutionStressWrapper
+from position_sizing import calculate_xauusd_lot_size, check_margin_sufficiency
 
 load_dotenv()
 
 app = FastAPI(title="MT5 Broker Bridge", version="1.0.0")
 risk_engine = RiskEngine()
 quality_monitor = ExecutionQualityMonitor()
+stress_wrapper = ExecutionStressWrapper()
 DEFAULT_SLIPPAGE_TOLERANCE_PIPS = float(os.getenv("SLIPPAGE_TOLERANCE_PIPS", "2.0"))
 MAX_ORDER_RETRIES = int(os.getenv("ORDER_MAX_RETRIES", "3"))
 RETRY_BASE_BACKOFF_MS = int(os.getenv("ORDER_RETRY_BASE_BACKOFF_MS", "200"))
 LATENCY_ALERT_MS = float(os.getenv("EXECUTION_LATENCY_ALERT_MS", "500"))
+STRICT_RISK_PERCENT_DEFAULT = float(os.getenv("STRICT_RISK_PERCENT", "1.0"))
+ENABLE_DYNAMIC_XAUUSD_SIZING = os.getenv("ENABLE_DYNAMIC_XAUUSD_SIZING", "1") == "1"
+MIN_POST_TRADE_FREE_MARGIN_PCT = float(os.getenv("MIN_POST_TRADE_FREE_MARGIN_PCT", "0.10"))
 
 
 class LiveTradeRequest(BaseModel):
@@ -35,6 +41,7 @@ class LiveTradeRequest(BaseModel):
     signal_bar_relation: str | None = None
     intended_price: float | None = None
     slippage_tolerance_pips: float | None = Field(default=None, gt=0)
+    strict_risk_percent: float | None = Field(default=None, gt=0, le=100)
 
 
 def _pip_size(symbol: str) -> float:
@@ -89,6 +96,20 @@ def _connect_mt5() -> None:
 
     if not initialized:
         raise HTTPException(status_code=503, detail=f"MT5 initialize failed: {mt5.last_error()}")
+
+
+def _compute_atr_price(symbol: str, period: int = 14, timeframe=mt5.TIMEFRAME_M5) -> float:
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, period + 1)
+    if rates is None or len(rates) < period + 1:
+        return 0.0
+
+    high = rates["high"][1:]
+    low = rates["low"][1:]
+    prev_close = rates["close"][:-1]
+    tr = []
+    for h, l, pc in zip(high, low, prev_close):
+        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return float(sum(tr[-period:]) / period) if tr else 0.0
 
 
 def _is_retriable_retcode(retcode: int | None) -> bool:
@@ -236,6 +257,78 @@ def execute_trade(request: LiveTradeRequest):
     stop_loss = price - (stop_loss_pips * pip_size) if is_buy else price + (stop_loss_pips * pip_size)
     take_profit = price + (take_profit_pips * pip_size) if is_buy else price - (take_profit_pips * pip_size)
 
+    if ENABLE_DYNAMIC_XAUUSD_SIZING and request.symbol.upper() == "XAUUSD":
+        account = mt5.account_info()
+        if account is None:
+            mt5.shutdown()
+            raise HTTPException(status_code=503, detail="Unable to read account info for dynamic sizing")
+
+        risk_percent = request.strict_risk_percent if request.strict_risk_percent is not None else STRICT_RISK_PERCENT_DEFAULT
+        atr_price = _compute_atr_price(request.symbol, period=14, timeframe=mt5.TIMEFRAME_M5)
+        sizing = calculate_xauusd_lot_size(
+            equity=float(account.equity),
+            risk_percent=float(risk_percent),
+            atr_14=float(atr_price),
+            entry_price=float(price),
+            action=request.action,
+            tick_value=float(symbol_info.trade_tick_value or 0.0),
+            tick_size=float(symbol_info.trade_tick_size or 0.0),
+            volume_step=float(step),
+            volume_min=float(min_vol),
+            volume_max=float(max_vol),
+            point=float(symbol_info.point or 0.0),
+            sl_atr_multiplier=1.5,
+        )
+
+        if not sizing.allowed:
+            mt5.shutdown()
+            send_telegram_alert(
+                "TRADE_ERROR",
+                "Dynamic sizing blocked trade.",
+                level="ERROR",
+                extra={"symbol": request.symbol, "action": request.action, "reason": sizing.reason},
+            )
+            raise HTTPException(status_code=422, detail={"code": "DYNAMIC_SIZING_BLOCK", "reason": sizing.reason})
+
+        volume = float(sizing.lot_size)
+        stop_loss = float(sizing.stop_loss_price)
+        sl_distance = abs(float(price) - stop_loss)
+        take_profit = float(price + (2.0 * sl_distance)) if is_buy else float(price - (2.0 * sl_distance))
+        stop_loss_pips = sl_distance / pip_size if pip_size > 0 else stop_loss_pips
+        take_profit_pips = (2.0 * sl_distance) / pip_size if pip_size > 0 else take_profit_pips
+
+        order_type_for_margin = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+        required_margin = mt5.order_calc_margin(order_type_for_margin, request.symbol, volume, float(price))
+        margin_ok, margin_reason = check_margin_sufficiency(
+            required_margin=required_margin,
+            free_margin=float(account.margin_free),
+            equity=float(account.equity),
+            min_post_trade_free_margin_pct=MIN_POST_TRADE_FREE_MARGIN_PCT,
+        )
+        if not margin_ok:
+            mt5.shutdown()
+            send_telegram_alert(
+                "TRADE_ERROR",
+                "Margin guard blocked trade.",
+                level="ERROR",
+                extra={
+                    "symbol": request.symbol,
+                    "action": request.action,
+                    "reason": margin_reason,
+                    "required_margin": required_margin,
+                    "free_margin": float(account.margin_free),
+                },
+            )
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "INSUFFICIENT_MARGIN_GUARD",
+                    "reason": margin_reason,
+                    "required_margin": required_margin,
+                    "free_margin": float(account.margin_free),
+                },
+            )
+
     deviation_points = 20
     if symbol_info.point and symbol_info.point > 0:
         deviation_points = max(1, int(round((slippage_tolerance_pips * pip_size) / symbol_info.point)))
@@ -256,7 +349,28 @@ def execute_trade(request: LiveTradeRequest):
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
-    result, attempt_count, order_send_ts, order_send_done_ts = _send_with_retry(request_payload)
+    stress_result = stress_wrapper.apply(
+        request_payload=request_payload,
+        symbol=request.symbol,
+        action=request.action,
+        symbol_point=float(symbol_info.point or 0.0),
+        volume_step=float(step),
+        volume_min=float(min_vol),
+    )
+    if stress_wrapper.enabled:
+        print(
+            f"[EXEC_STRESS] symbol={request.symbol} action={request.action} "
+            f"slippage_points={stress_result.slippage_points} "
+            f"requested_volume={stress_result.requested_volume:.2f} "
+            f"effective_volume={stress_result.effective_volume:.2f} "
+            f"partial_fill={stress_result.partial_fill_applied}"
+        )
+
+    effective_payload = stress_result.payload
+    effective_volume = float(stress_result.effective_volume)
+    effective_price = float(effective_payload.get("price", price))
+
+    result, attempt_count, order_send_ts, order_send_done_ts = _send_with_retry(effective_payload)
     execution_latency_ms = (order_send_done_ts - order_send_ts).total_seconds() * 1000.0
     print(f"[EXECUTION_LATENCY] symbol={request.symbol} action={request.action} latency_ms={execution_latency_ms:.1f}")
     if execution_latency_ms > LATENCY_ALERT_MS:
@@ -289,7 +403,7 @@ def execute_trade(request: LiveTradeRequest):
                 "symbol": request.symbol,
                 "action": request.action,
                 "ticket": int(result.order) if getattr(result, "order", 0) else None,
-                "price": round(float(price), 5),
+                "price": round(float(effective_price), 5),
                 "latency_ms": round(execution_latency_ms, 2),
             },
         )
@@ -324,20 +438,28 @@ def execute_trade(request: LiveTradeRequest):
                 "comment": result.comment,
                 "attempts": attempt_count,
                 "request": request_payload,
+                "effective_request": effective_payload,
             },
         )
 
+    status = "PARTIAL_FILLED" if stress_result.partial_fill_applied else "EXECUTED"
     return {
-        "status": "EXECUTED",
+        "status": status,
         "order": result.order,
         "deal": result.deal,
-        "volume": volume,
-        "price": price,
+        "volume": effective_volume,
+        "requested_volume": float(stress_result.requested_volume),
+        "price": effective_price,
         "sl": stop_loss,
         "tp": take_profit,
         "attempts": attempt_count,
         "execution_latency_ms": round(execution_latency_ms, 2),
         "slippage_tolerance_pips": slippage_tolerance_pips,
+        "synthetic_slippage_points": int(stress_result.slippage_points),
+        "synthetic_slippage_price_delta": float(stress_result.slippage_price_delta),
+        "synthetic_partial_fill_applied": bool(stress_result.partial_fill_applied),
+        "dynamic_sizing_enabled": bool(ENABLE_DYNAMIC_XAUUSD_SIZING and request.symbol.upper() == "XAUUSD"),
+        "strict_risk_percent": float(request.strict_risk_percent if request.strict_risk_percent is not None else STRICT_RISK_PERCENT_DEFAULT),
     }
 
 

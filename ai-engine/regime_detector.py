@@ -27,6 +27,16 @@ ADX_TRANSITIONAL_MAX = float(os.getenv("ADX_TRANSITIONAL_MAX", "25"))
 # Slope normalized by ATR (%-move over window divided by ATR%-of-price).
 SLOPE_TO_ATR_TREND_THRESHOLD = float(os.getenv("SLOPE_TO_ATR_TREND_THRESHOLD", "0.35"))
 
+HURST_WINDOW = int(os.getenv("REGIME_HURST_WINDOW", "96"))
+HURST_MIN_LAG = int(os.getenv("REGIME_HURST_MIN_LAG", "2"))
+HURST_MAX_LAG = int(os.getenv("REGIME_HURST_MAX_LAG", "20"))
+HURST_TRENDING_MIN = float(os.getenv("REGIME_HURST_TRENDING_MIN", "0.56"))
+HURST_MEAN_REVERTING_MAX = float(os.getenv("REGIME_HURST_MEAN_REVERTING_MAX", "0.46"))
+ATR_PERIOD = int(os.getenv("REGIME_ATR_PERIOD", "14"))
+ATR_LOOKBACK = int(os.getenv("REGIME_ATR_LOOKBACK", "160"))
+ATR_COMPRESSION_PERCENTILE_MAX = float(os.getenv("REGIME_ATR_COMPRESSION_PERCENTILE_MAX", "0.35"))
+ATR_EXPANSION_PERCENTILE_MIN = float(os.getenv("REGIME_ATR_EXPANSION_PERCENTILE_MIN", "0.60"))
+
 
 def _redis_client() -> redis.Redis:
     return redis.Redis(
@@ -217,43 +227,93 @@ def _close_slope_pct(df: pd.DataFrame, window: int = 30) -> float:
     return (end - start) / start
 
 
+def _hurst_exponent(prices: np.ndarray, min_lag: int = HURST_MIN_LAG, max_lag: int = HURST_MAX_LAG) -> float:
+    if prices is None or len(prices) < (max_lag + 8):
+        return 0.5
+
+    lags = np.arange(min_lag, max_lag + 1)
+    tau = []
+    for lag in lags:
+        diff = prices[lag:] - prices[:-lag]
+        std = float(np.std(diff))
+        tau.append(max(std, 1e-12))
+
+    y = np.log(np.array(tau))
+    x = np.log(lags.astype(float))
+    slope = np.polyfit(x, y, 1)[0]
+    hurst = float(slope * 2.0)
+    return max(0.0, min(1.0, hurst))
+
+
+def _rolling_hurst(df: pd.DataFrame, window: int = HURST_WINDOW) -> pd.Series:
+    close = df["close"].astype(float).to_numpy()
+    out = np.full(len(close), np.nan, dtype=float)
+    if len(close) < window:
+        return pd.Series(out, index=df.index, dtype=float)
+
+    for i in range(window - 1, len(close)):
+        sample = close[i - window + 1 : i + 1]
+        out[i] = _hurst_exponent(sample)
+
+    return pd.Series(out, index=df.index, dtype=float)
+
+
+def _rolling_atr_percentile(df: pd.DataFrame, period: int = ATR_PERIOD, lookback: int = ATR_LOOKBACK) -> pd.Series:
+    atr = _compute_atr_series(df, period=period)
+    out = np.full(len(atr), np.nan, dtype=float)
+    arr = atr.to_numpy(dtype=float)
+
+    for i in range(len(arr)):
+        start = max(0, i - lookback + 1)
+        window_vals = arr[start : i + 1]
+        window_vals = window_vals[~np.isnan(window_vals)]
+        if len(window_vals) < 20 or np.isnan(arr[i]):
+            continue
+        out[i] = float((window_vals <= arr[i]).sum() / len(window_vals))
+
+    return pd.Series(out, index=df.index, dtype=float)
+
+
 def _classify(features: dict[str, float]) -> tuple[str, str]:
-    adx = features["adx"]
-    atr_pct = features["atr_percentile"]
-    bb_pct = features["bb_bandwidth_percentile"]
-    swing_points = features["swing_points"]
-    autocorr = features["close_autocorr"]
-    slope_pct = features["close_slope_pct"]
-    atr_pct_of_price = max(float(features.get("atr_pct_of_price", 0.0)), 1e-9)
-    slope_to_atr = abs(slope_pct) / atr_pct_of_price
+    hurst = float(features.get("hurst", 0.5))
+    hurst_mean = float(features.get("hurst_mean", hurst))
+    atr_pct = float(features.get("atr_percentile", 0.5))
+    slope_pct = float(features.get("close_slope_pct", 0.0))
 
-    if atr_pct >= 0.85 and bb_pct >= 0.80 and adx >= 20:
-        if slope_pct >= 0:
-            return "HIGH_VOL_BREAKOUT", "High volatility expansion with upward pressure"
-        return "HIGH_VOL_BREAKOUT", "High volatility expansion with downward pressure"
+    if atr_pct <= ATR_COMPRESSION_PERCENTILE_MAX:
+        return "CHOP_COMPRESSION", "ATR percentile indicates volatility compression/chop"
 
-    if adx >= ADX_TRENDING_MIN and autocorr >= 0.12 and slope_pct > 0 and slope_to_atr >= SLOPE_TO_ATR_TREND_THRESHOLD:
-        return "TRENDING_UP", "Strong directional persistence and positive slope"
+    if hurst_mean <= HURST_MEAN_REVERTING_MAX:
+        return "MEAN_REVERTING", "Rolling Hurst indicates anti-persistent mean reversion"
 
-    if adx >= ADX_TRENDING_MIN and autocorr <= -0.05 and slope_pct < 0 and slope_to_atr >= SLOPE_TO_ATR_TREND_THRESHOLD:
-        return "TRENDING_DOWN", "Strong directional persistence and negative slope"
+    if hurst_mean >= HURST_TRENDING_MIN and atr_pct >= ATR_EXPANSION_PERCENTILE_MIN:
+        if slope_pct > 0:
+            return "EXPANSION_TREND_UP", "High-probability expansion regime with positive drift"
+        if slope_pct < 0:
+            return "EXPANSION_TREND_DOWN", "High-probability expansion regime with negative drift"
+        return "EXPANSION_BREAKOUT", "Expansion regime with neutral short-term slope"
 
-    if atr_pct <= 0.25 and bb_pct <= 0.30 and adx <= 18:
-        return "LOW_VOL_DRIFT", "Compressed volatility and weak directional drive"
+    return "NEUTRAL_TRANSITION", "No high-confidence expansion edge"
 
-    if adx <= ADX_RANGING_MAX and bb_pct <= 0.55 and swing_points >= 12:
-        return "RANGING", "Frequent swings with weak trend quality"
 
-    # Explicit ADX gray zone handling: 20-25 is transitional unless features strongly confirm trend.
-    if ADX_TRANSITIONAL_MIN <= adx < ADX_TRANSITIONAL_MAX:
-        return "TRANSITIONAL", "ADX gray zone (20-25): transition regime, avoid hard vetoes"
+def is_trade_regime_allowed(regime_payload: dict[str, Any], action: str | None = None) -> tuple[bool, str]:
+    regime = str(regime_payload.get("regime", "UNKNOWN")).upper()
+    action_upper = (action or "").upper()
 
-    if adx >= 22 and slope_pct >= 0 and slope_to_atr >= SLOPE_TO_ATR_TREND_THRESHOLD:
-        return "TRENDING_UP", "Fallback trend-up classification"
-    if adx >= 22 and slope_pct < 0 and slope_to_atr >= SLOPE_TO_ATR_TREND_THRESHOLD:
-        return "TRENDING_DOWN", "Fallback trend-down classification"
+    if regime == "EXPANSION_TREND_UP":
+        if action_upper and action_upper != "BUY":
+            return False, "Expansion up regime only allows BUY"
+        return True, "Expansion trend-up allowed"
 
-    return "RANGING", "Default classification: mixed structure"
+    if regime == "EXPANSION_TREND_DOWN":
+        if action_upper and action_upper != "SELL":
+            return False, "Expansion down regime only allows SELL"
+        return True, "Expansion trend-down allowed"
+
+    if regime == "EXPANSION_BREAKOUT":
+        return True, "Expansion breakout allowed"
+
+    return False, f"Hard regime filter blocked non-expansion regime: {regime}"
 
 
 def compute_regime(symbol: str, timeframe: str = "M5", bars: int = REGIME_LOOKBACK_BARS) -> dict[str, Any]:
@@ -270,23 +330,33 @@ def compute_regime(symbol: str, timeframe: str = "M5", bars: int = REGIME_LOOKBA
     tf = _timeframe_value(timeframe)
     rates = mt5.copy_rates_from_pos(symbol, tf, 0, bars)
     df = _to_df(rates)
-    if df.empty or len(df) < 80:
+    required_bars = max(80, HURST_WINDOW + HURST_MAX_LAG + 5)
+    if df.empty or len(df) < required_bars:
         return {
             "symbol": symbol,
             "timeframe": timeframe,
             "regime": "UNKNOWN",
-            "reason": "Insufficient market data",
+            "reason": f"Insufficient market data (need >= {required_bars} bars)",
             "features": {},
             "computed_at": datetime.now(timezone.utc).isoformat(),
         }
 
+    hurst_series = _rolling_hurst(df, window=HURST_WINDOW)
+    atr_pct_series = _rolling_atr_percentile(df, period=ATR_PERIOD, lookback=ATR_LOOKBACK)
+
+    hurst_latest = float(hurst_series.dropna().iloc[-1]) if not hurst_series.dropna().empty else 0.5
+    hurst_mean_tail = float(hurst_series.dropna().tail(20).mean()) if not hurst_series.dropna().empty else hurst_latest
+    atr_pct_latest = float(atr_pct_series.dropna().iloc[-1]) if not atr_pct_series.dropna().empty else 0.5
+
     features: dict[str, float] = {
         "adx": round(_compute_adx(df), 4),
-        "atr_percentile": round(_atr_percentile(df), 4),
+        "atr_percentile": round(atr_pct_latest, 4),
         "atr_pct_of_price": round(_atr_pct_of_price(df), 6),
         "swing_points": float(_swing_points(df, lookback=80)),
         "close_autocorr": round(_close_autocorr(df, lookback=80), 4),
         "close_slope_pct": round(_close_slope_pct(df, window=30), 6),
+        "hurst": round(hurst_latest, 4),
+        "hurst_mean": round(hurst_mean_tail, 4),
     }
 
     bb_abs, bb_pct = _bollinger_bandwidth_percentile(df)

@@ -10,3 +10,4 @@ psycopg[binary]
 pandas
 numpy
 matplotlib
+pyzmq

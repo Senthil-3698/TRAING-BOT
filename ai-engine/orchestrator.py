@@ -7,8 +7,9 @@ from news_aggregator import fetch_macro_news
 from strategist import validate_with_ai
 from trade_journal import TradeJournal
 from intermarket import get_intermarket_context
-from regime_detector import get_current_regime
+from regime_detector import get_current_regime, is_trade_regime_allowed
 from alerts import send_telegram_alert
+from zmq_bridge import publish_signal_async
 
 EXECUTION_ENGINE_URL = os.getenv("EXECUTION_ENGINE_URL", "http://localhost:8081/execute")
 journal = TradeJournal()
@@ -54,6 +55,28 @@ async def on_signal_received(signal):
         print(f"[ORCHESTRATOR] Regime detector unavailable, continuing fast-path: {error}")
     signal["market_regime"] = regime_context.get("regime", "UNKNOWN")
     signal["regime_context"] = regime_context
+
+    enforce_regime_filter = os.getenv("ENFORCE_EXPANSION_REGIME_FILTER", "1") == "1"
+    if enforce_regime_filter:
+        allowed, regime_reason = is_trade_regime_allowed(regime_context, action=action)
+        if not allowed:
+            rejection_reason = f"Regime hard filter veto: {regime_reason}"
+            print(f"[ORCHESTRATOR] {rejection_reason}")
+            journal.log_signal(
+                source=signal.get("source", "orchestrator"),
+                symbol=symbol,
+                action=action,
+                timeframe=tf,
+                signal_ts=_signal_ts(signal),
+                **_indicators(signal),
+                ai_decision="REJECTED",
+                ai_reasoning=rejection_reason,
+                ai_confidence=signal.get("confidence_score"),
+                decision_status="REJECTED",
+                rejection_reason=rejection_reason,
+                metadata={"stage": "hard_regime_filter", "regime": regime_context},
+            )
+            return
 
     bypass_ai_news_gate = os.getenv("BYPASS_AI_NEWS_GATE", "0") == "1"
     ai_structured = None
@@ -231,6 +254,14 @@ async def on_signal_received(signal):
             "intended_price": signal.get("intended_price"),
         }
 
+        zmq_message_id = None
+        try:
+            zmq_message_id = await publish_signal_async(payload)
+            if zmq_message_id and zmq_message_id != "DISABLED":
+                print(f"[ORCHESTRATOR] ZMQ signal published message_id={zmq_message_id}")
+        except Exception as zmq_error:
+            print(f"[ORCHESTRATOR] ZMQ publish skipped due to error: {zmq_error}")
+
         try:
             async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
                 response = await client.post(EXECUTION_ENGINE_URL, json=payload)
@@ -283,7 +314,7 @@ async def on_signal_received(signal):
                     entry_price=entry_price,
                     stop_loss=sl,
                     take_profit=tp,
-                    metadata={"execution_response": result, "intermarket": intermarket_context, "regime": regime_context, "ai_structured": ai_structured},
+                    metadata={"execution_response": result, "intermarket": intermarket_context, "regime": regime_context, "ai_structured": ai_structured, "zmq_message_id": zmq_message_id},
                 )
                 print("TRADE_DISPATCHED")
             elif response.status_code == 403:
@@ -308,7 +339,7 @@ async def on_signal_received(signal):
                     ai_confidence=ai_confidence,
                     decision_status="REJECTED",
                     rejection_reason=rejection_reason,
-                    metadata={"status_code": response.status_code, "response": response.text, "intermarket": intermarket_context, "regime": regime_context, "ai_structured": ai_structured},
+                    metadata={"status_code": response.status_code, "response": response.text, "intermarket": intermarket_context, "regime": regime_context, "ai_structured": ai_structured, "zmq_message_id": zmq_message_id},
                 )
             else:
                 print(f"Execution engine returned {response.status_code}: {response.text}")
@@ -332,7 +363,7 @@ async def on_signal_received(signal):
                     ai_confidence=ai_confidence,
                     decision_status="REJECTED",
                     rejection_reason=rejection_reason,
-                    metadata={"status_code": response.status_code, "response": response.text, "intermarket": intermarket_context, "regime": regime_context, "ai_structured": ai_structured},
+                    metadata={"status_code": response.status_code, "response": response.text, "intermarket": intermarket_context, "regime": regime_context, "ai_structured": ai_structured, "zmq_message_id": zmq_message_id},
                 )
         except httpx.HTTPError as error:
             print(f"Execution dispatch failed: {error}")
@@ -355,7 +386,7 @@ async def on_signal_received(signal):
                 ai_confidence=ai_confidence,
                 decision_status="REJECTED",
                 rejection_reason=f"Execution dispatch failed: {error}",
-                metadata={"exception": str(error), "intermarket": intermarket_context, "regime": regime_context, "ai_structured": ai_structured},
+                metadata={"exception": str(error), "intermarket": intermarket_context, "regime": regime_context, "ai_structured": ai_structured, "zmq_message_id": zmq_message_id},
             )
     else:
         print(f"Signal Vetoed by AI: {reason}")
