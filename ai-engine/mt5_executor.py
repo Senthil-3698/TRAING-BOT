@@ -20,6 +20,9 @@ _mt5_initialized = False
 risk_engine = RiskEngine()
 quality_monitor = ExecutionQualityMonitor()
 
+# Get bot magic number from environment, fallback to 123456
+BOT_MAGIC_ID = int(os.getenv("BOT_MAGIC_IDS", "123456").split(",")[0].strip())
+
 MAX_SLIPPAGE_POINTS = 5  # 0.5 pips on XAUUSD point convention
 DEFAULT_FALLBACK_SL_PIPS = 50.0
 DEFAULT_TP_RR = 2.0
@@ -193,7 +196,7 @@ def execute_market_order(symbol, action, lot_size=None, sl_pips=None, tp_pips=No
         "deviation": MAX_SLIPPAGE_POINTS,
         "sl": sl,
         "tp": tp,
-        "magic": 123456,
+        "magic": BOT_MAGIC_ID,
         "comment": "Sentinel AI Execution",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": filling_mode,
@@ -249,6 +252,8 @@ def partial_close_position(ticket, percentage=0.5):
     """
     Institutional Exit: Closes a portion of the position to bank profits.
     """
+    global _mt5_initialized
+    
     if not _initialize_mt5():
         print("MT5 initialize() failed")
         return None
@@ -256,6 +261,7 @@ def partial_close_position(ticket, percentage=0.5):
     position = mt5.positions_get(ticket=ticket)
     if not position:
         mt5.shutdown()
+        _mt5_initialized = False
         return None
 
     pos = position[0]
@@ -265,6 +271,7 @@ def partial_close_position(ticket, percentage=0.5):
     # Ensure we don't try to close less than the minimum lot (0.01)
     if lot_to_close < 0.01:
         mt5.shutdown()
+        _mt5_initialized = False
         return None
 
     # To close a BUY, we send a SELL for the partial lot
@@ -278,7 +285,7 @@ def partial_close_position(ticket, percentage=0.5):
         "type": order_type,
         "position": ticket, # CRITICAL: This links the order to the existing trade
         "price": price,
-        "magic": 123456,
+        "magic": BOT_MAGIC_ID,
         "comment": f"Partial Close {int(percentage*100)}%",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
@@ -297,4 +304,5 @@ def partial_close_position(ticket, percentage=0.5):
 
     result = mt5.order_send(request)
     mt5.shutdown()
+    _mt5_initialized = False
     return result

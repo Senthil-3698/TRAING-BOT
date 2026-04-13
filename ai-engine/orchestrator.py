@@ -55,7 +55,7 @@ async def on_signal_received(signal):
     signal["market_regime"] = regime_context.get("regime", "UNKNOWN")
     signal["regime_context"] = regime_context
 
-    bypass_ai_news_gate = os.getenv("BYPASS_AI_NEWS_GATE", "1") == "1"
+    bypass_ai_news_gate = os.getenv("BYPASS_AI_NEWS_GATE", "0") == "1"
     ai_structured = None
 
     if bypass_ai_news_gate:

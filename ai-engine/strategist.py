@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg
+import redis
 from dotenv import load_dotenv
 from google import genai
 
@@ -611,7 +612,37 @@ async def validate_with_ai(signal_data, macro_bias):
         return fallback
 
 def process_queue():
+    """
+    Consumes signals from Redis queue and processes them with AI validation.
+    Continuously pulls signals using BLPOP to avoid busy-waiting.
+    """
+    import asyncio
+    import time
+    from orchestrator import on_signal_received
+    
+    r = redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", "6380")),
+        db=0,
+    )
+    queue_key = os.getenv("SIGNAL_QUEUE_KEY", "signal_queue")
+    
     while True:
-        # Pulls the next signal from Redis to process it
-        # This ensures we don't miss any alerts
-        pass
+        try:
+            # BLPOP blocks for up to 10 seconds waiting for new signal
+            signal_data = r.blpop(queue_key, timeout=10)
+            if not signal_data:
+                # Timeout - no signal received, continue waiting
+                continue
+            
+            _, signal_json = signal_data
+            signal_dict = json.loads(signal_json)
+            
+            # Run orchestrator async handler for full AI validation
+            try:
+                asyncio.run(on_signal_received(signal_dict))
+            except Exception as e:
+                print(f"[STRATEGIST] Error processing signal {signal_dict.get('symbol')}: {e}")
+        except Exception as e:
+            print(f"[STRATEGIST QUEUE] Redis error: {e}")
+            time.sleep(1)  # Brief backoff before retrying

@@ -595,56 +595,6 @@ class RiskEngine:
         step = info.volume_step or 0.01
         return round(round(capped / step) * step, 2)
 
-        def calculate_position_size(
-                self,
-                *,
-                symbol: str,
-                stop_loss_pips: float,
-        ) -> float:
-                """
-                Position size using a volatility-adjusted fractional Kelly risk fraction.
-
-                Math:
-                - Estimate rolling edge from last N=50 closed trades in signal_journal.
-                    W = win probability.
-                    R = average win / absolute average loss.
-                - Kelly-optimal fraction (fixed-odds approximation):
-                    f* = W - (1 - W) / R
-                - Use quarter-Kelly for robustness:
-                    f = 0.25 * max(0, f*)
-                - Clamp base risk fraction to [0.25%, 2%].
-                - Scale inversely by current ATR percentile so higher realized volatility
-                    reduces size.
-
-                If fewer than 30 closed trades exist, use flat 1% risk.
-
-                References:
-                - Kelly, J. L. (1956), "A New Interpretation of Information Rate".
-                - Thorp, E. O. (1969), "Optimal Gambling Systems for Favorable Games".
-                """
-                if not self._ensure_mt5():
-                        return 0.01
-                account = mt5.account_info()
-                if account is None or stop_loss_pips <= 0:
-                        return 0.01
-
-                info = mt5.symbol_info(symbol)
-                if info is None or info.point <= 0:
-                        return 0.01
-
-                risk_fraction = self._kelly_risk_fraction(symbol)
-                equity = float(account.equity)
-                risk_dollars = equity * risk_fraction
-                pip_value_per_lot = info.point * (info.trade_contract_size or 100)
-                sl_dollars_per_lot = stop_loss_pips * pip_value_per_lot
-                if sl_dollars_per_lot <= 0:
-                        return 0.01
-
-                raw = risk_dollars / sl_dollars_per_lot
-                capped = max(info.volume_min or 0.01, min(raw, info.volume_max or raw))
-                step = info.volume_step or 0.01
-                return round(round(capped / step) * step, 2)
-
     def _atr_percentile(self, symbol: str) -> float:
         rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 260)
         if rates is None or len(rates) < 40:
@@ -679,14 +629,19 @@ class RiskEngine:
         return less_or_equal / len(atr_series)
 
     def _closed_trade_returns(self, limit: int) -> list[float]:
+        """
+        Fetch R-multiple returns from closed trades for Kelly calculation.
+        IMPORTANT: Only uses pnl_r (R-multiples), never mixes with pnl_usd.
+        Skips trades where pnl_r is NULL to maintain consistent scale.
+        """
         if not self.journal.enabled:
             return []
 
         query = """
-            SELECT pnl_r, pnl_usd
+            SELECT pnl_r
             FROM signal_journal
             WHERE is_filled = TRUE
-              AND (pnl_r IS NOT NULL OR pnl_usd IS NOT NULL)
+              AND pnl_r IS NOT NULL
             ORDER BY COALESCE(signal_ts, journal_ts) DESC
             LIMIT %s
         """
@@ -699,11 +654,9 @@ class RiskEngine:
             return []
 
         values: list[float] = []
-        for pnl_r, pnl_usd in rows:
+        for (pnl_r,) in rows:
             if pnl_r is not None:
                 values.append(float(pnl_r))
-            elif pnl_usd is not None:
-                values.append(float(pnl_usd))
         return values
 
     def _kelly_risk_fraction(self, symbol: str) -> float:
