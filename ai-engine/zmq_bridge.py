@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import uuid
 from dataclasses import dataclass
@@ -9,6 +8,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
+
+# INSTITUTIONAL PATCH: Use orjson for asynchronous, zero-jitter serialization
+try:
+    import orjson  # type: ignore[import-not-found]
+except ImportError:
+    raise RuntimeError("orjson is not installed. Run: pip install orjson")
 
 try:
     import zmq
@@ -51,6 +56,9 @@ class ZmqSignalBridge:
 
         self._rep = self._ctx.socket(zmq.REP)
         self._rep.setsockopt(zmq.LINGER, 0)
+        # INSTITUTIONAL PATCH: Prevent REQ/REP deadlocks.
+        self._rep.setsockopt(zmq.RCVTIMEO, 2000)
+        self._rep.setsockopt(zmq.SNDTIMEO, 2000)
 
     @property
     def available(self) -> bool:
@@ -113,8 +121,10 @@ class ZmqSignalBridge:
         }
 
         try:
+            # INSTITUTIONAL PATCH: orjson dumps straight to bytes natively.
+            payload_bytes = orjson.dumps(envelope)
             await self._pub.send_multipart(
-                [b"trade.signal", json.dumps(envelope, default=str).encode("utf-8")]
+                [b"trade.signal", payload_bytes]
             )
             return message_id
         except Exception as error:
@@ -124,9 +134,10 @@ class ZmqSignalBridge:
     async def _heartbeat_server_loop(self) -> None:
         while self._running:
             try:
-                raw = await self._rep.recv()
+                # INSTITUTIONAL PATCH: Non-blocking receives prevent complete loop freezes.
+                raw = await self._rep.recv(flags=zmq.NOBLOCK)
                 now_ts = asyncio.get_running_loop().time()
-                request = json.loads(raw.decode("utf-8")) if raw else {}
+                request = orjson.loads(raw) if raw else {}
                 client_id = str(request.get("client_id") or "unknown")
                 self._clients_last_seen[client_id] = now_ts
 
@@ -135,14 +146,16 @@ class ZmqSignalBridge:
                     "server_ts": datetime.now(timezone.utc).isoformat(),
                     "heartbeat_timeout_seconds": self.config.heartbeat_timeout_seconds,
                 }
-                await self._rep.send_json(response)
+                # INSTITUTIONAL PATCH: Non-blocking sends.
+                await self._rep.send(orjson.dumps(response), flags=zmq.NOBLOCK)
+            except zmq.Again:
+                # Normal behavior: no heartbeat received this tick.
+                await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 break
             except Exception as error:
-                try:
-                    await self._rep.send_json({"ok": False, "error": str(error)})
-                except Exception:
-                    pass
+                print(f"[ZMQ] Heartbeat loop error: {error}")
+                await asyncio.sleep(0.1)
 
     async def _heartbeat_sweep_loop(self) -> None:
         while self._running:
