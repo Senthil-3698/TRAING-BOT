@@ -1,89 +1,67 @@
 from __future__ import annotations
 
 import argparse
-import json
 import statistics
 import time
-import uuid
 
 import zmq
 
 
-def run_benchmark(
-    *,
-    count: int,
-    topic: str,
-    pub_endpoint: str,
-    echo_rep_endpoint: str,
-    timeout_ms: int,
-    inter_signal_delay_ms: int,
-) -> None:
+def _make_socket(context: zmq.Context, endpoint: str, timeout_ms: int) -> zmq.Socket:
+    req = context.socket(zmq.REQ)
+    req.setsockopt(zmq.LINGER, 0)
+    req.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    req.setsockopt(zmq.SNDTIMEO, timeout_ms)
+    req.connect(endpoint)
+    return req
+
+
+def run_benchmark(*, count: int, echo_endpoint: str, timeout_ms: int, inter_signal_delay_ms: int) -> None:
     context = zmq.Context.instance()
+    req = _make_socket(context, echo_endpoint, timeout_ms)
 
-    pub = context.socket(zmq.PUB)
-    pub.setsockopt(zmq.LINGER, 0)
-    pub.bind(pub_endpoint)
-
-    rep = context.socket(zmq.REP)
-    rep.setsockopt(zmq.LINGER, 0)
-    rep.bind(echo_rep_endpoint)
-
-    # Give the MT5 SUB socket a moment to establish subscription.
     time.sleep(0.35)
 
-    poller = zmq.Poller()
-    poller.register(rep, zmq.POLLIN)
-
-    send_times: dict[str, int] = {}
     rtt_ms: list[float] = []
     timeouts = 0
 
     print("[LATENCY] Starting ZeroMQ RTT benchmark")
-    print(f"[LATENCY] count={count} topic={topic} pub={pub_endpoint} echo_rep={echo_rep_endpoint}")
+    print(f"[LATENCY] count={count} echo_endpoint={echo_endpoint}")
 
-    try:
-        for seq in range(1, count + 1):
-            message_id = str(uuid.uuid4())
-            t0_ns = time.perf_counter_ns()
-            send_times[message_id] = t0_ns
+    for seq in range(1, count + 1):
+        t0_ns = time.perf_counter_ns()
 
-            envelope = {
-                "type": "LATENCY_PING",
-                "sequence": seq,
-                "message_id": message_id,
-                "python_send_perf_ns": t0_ns,
-            }
+        payload = (
+            f'{{"type":"LATENCY_PING","sequence":{seq},"python_send_perf_ns":{t0_ns}}}'
+            .encode("utf-8")
+        )
 
-            pub.send_multipart([topic.encode("utf-8"), json.dumps(envelope).encode("utf-8")])
+        try:
+            req.send(payload)
+        except zmq.Again:
+            timeouts += 1
+            # Send itself timed out — recreate socket
+            req.close(0)
+            req = _make_socket(context, echo_endpoint, timeout_ms)
+            continue
 
-            ready = dict(poller.poll(timeout_ms))
-            if rep not in ready:
-                timeouts += 1
-                continue
-
-            raw = rep.recv()
+        try:
+            _echo = req.recv()
             recv_ns = time.perf_counter_ns()
+        except zmq.Again:
+            timeouts += 1
+            # Recv timed out — REQ socket is now stuck, must recreate
+            req.close(0)
+            req = _make_socket(context, echo_endpoint, timeout_ms)
+            continue
 
-            try:
-                echo = json.loads(raw.decode("utf-8"))
-                echoed_id = str(echo.get("message_id", ""))
-                if not echoed_id or echoed_id not in send_times:
-                    rep.send_json({"ok": False, "error": "unknown_message_id"})
-                    continue
+        rtt = (recv_ns - t0_ns) / 1_000_000.0
+        rtt_ms.append(rtt)
 
-                t_send_ns = send_times.pop(echoed_id)
-                rtt = (recv_ns - t_send_ns) / 1_000_000.0
-                rtt_ms.append(rtt)
-                rep.send_json({"ok": True, "message_id": echoed_id})
-            except Exception as error:
-                rep.send_json({"ok": False, "error": str(error)})
+        if inter_signal_delay_ms > 0:
+            time.sleep(inter_signal_delay_ms / 1000.0)
 
-            if inter_signal_delay_ms > 0:
-                time.sleep(inter_signal_delay_ms / 1000.0)
-
-    finally:
-        rep.close(0)
-        pub.close(0)
+    req.close(0)
 
     if not rtt_ms:
         print("[LATENCY] No successful RTT samples. Is MT5 echo EA running and connected?")
@@ -94,34 +72,29 @@ def run_benchmark(
     min_v = min(rtt_ms)
     max_v = max(rtt_ms)
     p50 = statistics.median(rtt_ms)
-    p95_idx = max(0, min(len(rtt_ms) - 1, int(round((len(rtt_ms) - 1) * 0.95))))
-    p95 = sorted(rtt_ms)[p95_idx]
+    p95 = sorted(rtt_ms)[max(0, min(len(rtt_ms) - 1, int(round((len(rtt_ms) - 1) * 0.95))))]
 
     print("\n--- ZMQ RTT RESULTS (ms) ---")
-    print(f"Samples: {len(rtt_ms)}/{count}")
+    print(f"Samples:  {len(rtt_ms)}/{count}")
     print(f"Timeouts: {timeouts}")
-    print(f"Average: {avg:.6f}")
-    print(f"Minimum: {min_v:.6f}")
-    print(f"Maximum: {max_v:.6f}")
-    print(f"P50:     {p50:.6f}")
-    print(f"P95:     {p95:.6f}")
+    print(f"Average:  {avg:.6f}")
+    print(f"Minimum:  {min_v:.6f}")
+    print(f"Maximum:  {max_v:.6f}")
+    print(f"P50:      {p50:.6f}")
+    print(f"P95:      {p95:.6f}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ZeroMQ RTT benchmark between Python and MT5 echo EA")
     parser.add_argument("--count", type=int, default=1000)
-    parser.add_argument("--topic", default="trade.signal")
-    parser.add_argument("--pub-endpoint", default="tcp://127.0.0.1:5556")
-    parser.add_argument("--echo-rep-endpoint", default="tcp://127.0.0.1:5557")
+    parser.add_argument("--echo-endpoint", default="tcp://127.0.0.1:5555")
     parser.add_argument("--timeout-ms", type=int, default=2500)
     parser.add_argument("--inter-signal-delay-ms", type=int, default=0)
     args = parser.parse_args()
 
     run_benchmark(
         count=args.count,
-        topic=args.topic,
-        pub_endpoint=args.pub_endpoint,
-        echo_rep_endpoint=args.echo_rep_endpoint,
+        echo_endpoint=args.echo_endpoint,
         timeout_ms=args.timeout_ms,
         inter_signal_delay_ms=args.inter_signal_delay_ms,
     )

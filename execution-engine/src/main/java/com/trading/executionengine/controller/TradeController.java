@@ -75,7 +75,6 @@ public class TradeController {
 
         tradeRepository.save(trade);
 
-        // Authoritative risk and sizing now run in Python RiskEngine (broker bridge).
         String optionalFields = "";
         if (request.intendedPrice() != null) {
             optionalFields += String.format(",\"intended_price\":%.10f", request.intendedPrice());
@@ -93,121 +92,112 @@ public class TradeController {
             optionalFields
         );
 
-        try {
-            HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(5))
-                .build();
+        HttpClient client = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .build();
 
-            HttpRequest bridgeRequest = HttpRequest.newBuilder()
-                .uri(URI.create(mt5BridgeUrl))
-                .timeout(Duration.ofSeconds(10))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(bridgePayload))
-                .build();
+        HttpRequest bridgeRequest = HttpRequest.newBuilder()
+            .uri(URI.create(mt5BridgeUrl))
+            .timeout(Duration.ofSeconds(10))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(bridgePayload))
+            .build();
 
-            HttpResponse<String> bridgeResponse = null;
-            int attempts = 0;
-            IOException lastIoError = null;
-            InterruptedException lastInterrupted = null;
+        HttpResponse<String> bridgeResponse = null;
+        int attempts = 0;
+        IOException lastIoError = null;
+        InterruptedException lastInterrupted = null;
 
-            for (int attempt = 1; attempt <= MAX_BRIDGE_RETRIES; attempt++) {
-                attempts = attempt;
-                Instant sendStart = Instant.now();
-                try {
-                    bridgeResponse = client.send(bridgeRequest, HttpResponse.BodyHandlers.ofString());
-                } catch (IOException ioError) {
-                    lastIoError = ioError;
-                } catch (InterruptedException interruptedError) {
-                    lastInterrupted = interruptedError;
-                    Thread.currentThread().interrupt();
-                    break;
-                }
+        for (int attempt = 1; attempt <= MAX_BRIDGE_RETRIES; attempt++) {
+            attempts = attempt;
+            Instant sendStart = Instant.now();
+            try {
+                bridgeResponse = client.send(bridgeRequest, HttpResponse.BodyHandlers.ofString());
+            } catch (IOException ioError) {
+                lastIoError = ioError;
+            } catch (InterruptedException interruptedError) {
+                lastInterrupted = interruptedError;
+                Thread.currentThread().interrupt();
+                break;
+            }
 
-                long latencyMs = Duration.between(sendStart, Instant.now()).toMillis();
+            long latencyMs = Duration.between(sendStart, Instant.now()).toMillis();
+            System.out.printf(
+                "[EXECUTION_LATENCY] symbol=%s action=%s attempt=%d latency_ms=%d%n",
+                request.symbol(),
+                request.action(),
+                attempt,
+                latencyMs
+            );
+            if (latencyMs > LATENCY_ALERT_MS) {
                 System.out.printf(
-                    "[EXECUTION_LATENCY] symbol=%s action=%s attempt=%d latency_ms=%d%n",
+                    "[EXECUTION_LATENCY_ALERT] symbol=%s action=%s attempt=%d latency_ms=%d threshold_ms=%d%n",
                     request.symbol(),
                     request.action(),
                     attempt,
-                    latencyMs
+                    latencyMs,
+                    LATENCY_ALERT_MS
                 );
-                if (latencyMs > LATENCY_ALERT_MS) {
-                    System.out.printf(
-                        "[EXECUTION_LATENCY_ALERT] symbol=%s action=%s attempt=%d latency_ms=%d threshold_ms=%d%n",
-                        request.symbol(),
-                        request.action(),
-                        attempt,
-                        latencyMs,
-                        LATENCY_ALERT_MS
-                    );
-                }
+            }
 
-                if (bridgeResponse != null && bridgeResponse.statusCode() == 200) {
+            if (bridgeResponse != null && bridgeResponse.statusCode() == 200) {
+                break;
+            }
+
+            boolean retriableStatus = bridgeResponse != null
+                    && (bridgeResponse.statusCode() >= 500 || bridgeResponse.statusCode() == 429);
+            if (attempt < MAX_BRIDGE_RETRIES && retriableStatus) {
+                long backoffMs = RETRY_BASE_BACKOFF_MS * (1L << (attempt - 1));
+                System.out.printf(
+                    "[BRIDGE_RETRY] symbol=%s action=%s attempt=%d status=%d backoff_ms=%d%n",
+                    request.symbol(),
+                    request.action(),
+                    attempt,
+                    bridgeResponse.statusCode(),
+                    backoffMs
+                );
+                try {
+                    Thread.sleep(backoffMs);
+                } catch (InterruptedException interruptedSleep) {
+                    Thread.currentThread().interrupt();
                     break;
                 }
-
-                boolean retriableStatus = bridgeResponse != null
-                        && (bridgeResponse.statusCode() >= 500 || bridgeResponse.statusCode() == 429);
-                if (attempt < MAX_BRIDGE_RETRIES && retriableStatus) {
-                    long backoffMs = RETRY_BASE_BACKOFF_MS * (1L << (attempt - 1));
-                    System.out.printf(
-                        "[BRIDGE_RETRY] symbol=%s action=%s attempt=%d status=%d backoff_ms=%d%n",
-                        request.symbol(),
-                        request.action(),
-                        attempt,
-                        bridgeResponse.statusCode(),
-                        backoffMs
-                    );
-                    try {
-                        Thread.sleep(backoffMs);
-                    } catch (InterruptedException interruptedSleep) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                } else {
-                    break;
-                }
+            } else {
+                break;
             }
-
-            if (bridgeResponse == null) {
-                if (lastInterrupted != null) {
-                    return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                            .body("Trade queued but MT5 bridge call interrupted.");
-                }
-                String message = lastIoError != null ? lastIoError.getMessage() : "No response from bridge.";
-                return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                        .body("Trade queued but MT5 bridge call failed after retries: " + message);
-            }
-
-            if (bridgeResponse.statusCode() != 200) {
-                return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                    .body("Trade queued but MT5 bridge rejected execution after " + attempts + " attempts: " + bridgeResponse.body());
-            }
-
-            try {
-                JsonNode bridgeResult = objectMapper.readTree(bridgeResponse.body());
-                JsonNode orderNode = bridgeResult.get("order");
-                if (orderNode != null && !orderNode.isNull()) {
-                    TradeEvent event = new TradeEvent();
-                    event.setId(UUID.randomUUID());
-                    event.setTicketId(orderNode.asText());
-                    event.setEventType("ENTRY");
-                    event.setTimestamp(Instant.now());
-                    tradeEventRepository.save(event);
-                }
-            } catch (Exception parseError) {
-                // Entry event logging is observability only; do not block live execution.
-            }
-
-            return ResponseEntity.ok(bridgeResponse.body());
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                    .body("Trade queued but MT5 bridge call failed: " + error.getMessage());
-        } catch (IOException error) {
-            return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                .body("Trade queued but MT5 bridge call failed: " + error.getMessage());
         }
+
+        if (bridgeResponse == null) {
+            if (lastInterrupted != null) {
+                return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                        .body("Trade queued but MT5 bridge call interrupted.");
+            }
+            String message = lastIoError != null ? lastIoError.getMessage() : "No response from bridge.";
+            return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                    .body("Trade queued but MT5 bridge call failed after retries: " + message);
+        }
+
+        if (bridgeResponse.statusCode() != 200) {
+            return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                .body("Trade queued but MT5 bridge rejected execution after " + attempts + " attempts: " + bridgeResponse.body());
+        }
+
+        try {
+            JsonNode bridgeResult = objectMapper.readTree(bridgeResponse.body());
+            JsonNode orderNode = bridgeResult.get("order");
+            if (orderNode != null && !orderNode.isNull()) {
+                TradeEvent event = new TradeEvent();
+                event.setId(UUID.randomUUID());
+                event.setTicketId(orderNode.asText());
+                event.setEventType("ENTRY");
+                event.setTimestamp(Instant.now());
+                tradeEventRepository.save(event);
+            }
+        } catch (Exception parseError) {
+            // Entry event logging is observability only; do not block live execution.
+        }
+
+        return ResponseEntity.ok(bridgeResponse.body());
     }
 
     @PostMapping("/events")

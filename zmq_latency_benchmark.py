@@ -1,95 +1,58 @@
-import argparse
-import time
-import statistics
-import json
-import sys
+﻿from __future__ import annotations
+import argparse, statistics, time
+import zmq
 
-try:
-    import zmq
-except ImportError:
-    print("pyzmq is not installed. Run: pip install pyzmq")
-    sys.exit(1)
+def _make_socket(context, endpoint, timeout_ms):
+    req = context.socket(zmq.REQ)
+    req.setsockopt(zmq.LINGER, 0)
+    req.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    req.setsockopt(zmq.SNDTIMEO, timeout_ms)
+    req.connect(endpoint)
+    return req
 
-
-def run_benchmark(count: int, timeout_ms: int):
-    context = zmq.Context()
-
-    # Setup PUB socket (Sending to MT5)
-    pub = context.socket(zmq.PUB)
-    pub.bind("tcp://127.0.0.1:5556")
-
-    # Setup REP socket (Receiving Echo from MT5)
-    rep = context.socket(zmq.REP)
-    rep.RCVTIMEO = timeout_ms
-    rep.bind("tcp://127.0.0.1:5557")
-
-    print("[ZMQ] Benchmark Engine Online.")
-    print("[ZMQ] PUB bound to 5556 | REP bound to 5557")
-    print("Waiting 2 seconds for MT5 EA to establish connection...")
-    time.sleep(2.0)
-
-    latencies = []
+def run_benchmark(count, timeout_ms, echo_endpoint="tcp://127.0.0.1:5555", inter_signal_delay_ms=0):
+    context = zmq.Context.instance()
+    req = _make_socket(context, echo_endpoint, timeout_ms)
+    time.sleep(0.35)
+    rtt_ms = []
     timeouts = 0
-
-    print(f"Firing {count} signals...")
-
-    for _ in range(count):
-        # We use time.perf_counter() for extreme microsecond precision
-        start_time = time.perf_counter()
-
-        # Send multipart message exactly as MT5 expects
-        pub.send_multipart([b"trade.signal", b'{"test": "ping"}'])
-
+    print("[LATENCY] Starting ZeroMQ RTT benchmark")
+    for seq in range(1, count + 1):
+        t0_ns = time.perf_counter_ns()
+        payload = f'{{"type":"LATENCY_PING","seq":{seq}}}'.encode()
         try:
-            # Wait for the MT5 REQ socket to bounce the echo back
-            _echo = rep.recv()
-            end_time = time.perf_counter()
-
-            # Send an acknowledgment back to MT5 to complete the REQ/REP cycle
-            rep.send(b'{"ok": true}')
-
-            # Calculate RTT in milliseconds
-            rtt_ms = (end_time - start_time) * 1000
-            latencies.append(rtt_ms)
-
+            req.send(payload)
         except zmq.Again:
             timeouts += 1
-
-        # 1ms delay between ticks to simulate high-frequency bursts without overflowing buffers
-        time.sleep(0.001)
-
-    # Output Institutional Metrics
-    print("\n" + "=" * 30)
-    print(" ZERO-MQ LATENCY BENCHMARK ")
-    print("=" * 30)
-    print(f"Samples Received : {len(latencies)} / {count}")
-    print(f"Timeouts         : {timeouts}")
-
-    if latencies:
-        print(f"Average Latency  : {statistics.mean(latencies):.3f} ms")
-        print(f"Minimum Latency  : {min(latencies):.3f} ms")
-        print(f"Maximum Latency  : {max(latencies):.3f} ms")
-        print("=" * 30)
-
-        if statistics.mean(latencies) < 5.0:
-            print("[STATUS] INSTITUTIONAL GRADE. Cleared for MT5 deployment.")
-        else:
-            print("[STATUS] WARNING: Latency exceeds 5ms. Optimization required.")
-    else:
-        print("\n[!] CRITICAL FAILURE: 0 samples received.")
-        print("Checklist:")
-        print("1. Is ZeroMqLatencyEchoEA.mq5 running on an MT5 chart?")
-        print("2. Did you check 'Allow DLL imports' in MT5 settings?")
-
-    rep.close(0)
-    pub.close(0)
-    context.term()
-
+            req.close(0)
+            req = _make_socket(context, echo_endpoint, timeout_ms)
+            continue
+        try:
+            req.recv()
+            rtt_ms.append((time.perf_counter_ns() - t0_ns) / 1e6)
+        except zmq.Again:
+            timeouts += 1
+            req.close(0)
+            req = _make_socket(context, echo_endpoint, timeout_ms)
+    req.close(0)
+    if not rtt_ms:
+        print(f"[LATENCY] No samples. Timeouts={timeouts}")
+        return
+    s = sorted(rtt_ms)
+    print(f"\n--- ZMQ RTT RESULTS (ms) ---")
+    print(f"Samples:  {len(rtt_ms)}/{count}")
+    print(f"Timeouts: {timeouts}")
+    print(f"Average:  {statistics.fmean(rtt_ms):.3f}")
+    print(f"Min:      {min(rtt_ms):.3f}")
+    print(f"Max:      {max(rtt_ms):.3f}")
+    print(f"P50:      {statistics.median(rtt_ms):.3f}")
+    print(f"P95:      {s[int(len(s)*0.95)]:.3f}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ZMQ Latency RTT Benchmark")
-    parser.add_argument("--count", type=int, default=1000, help="Number of signals to send")
-    parser.add_argument("--timeout-ms", type=int, default=2500, help="Receive timeout in milliseconds")
-    args = parser.parse_args()
-
-    run_benchmark(args.count, args.timeout_ms)
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--count", type=int, default=1000)
+    p.add_argument("--timeout-ms", type=int, default=2500)
+    p.add_argument("--echo-endpoint", default="tcp://127.0.0.1:5555")
+    a = p.parse_args()
+    run_benchmark(a.count, a.timeout_ms, a.echo_endpoint)
